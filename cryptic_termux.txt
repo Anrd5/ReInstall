@@ -1,41 +1,3 @@
-cat > ~/fetch_and_inspect_cryptic.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-OUTDIR="$HOME/cryptic_inspect"
-OUTFILE="$OUTDIR/cryptic_termux.sh"
-REMOTE1="https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/cryptic_termux.txt"
-
-mkdir -p "$OUTDIR"
-rm -f "$OUTFILE"
-
-echo "Attempt 1: curl (normal)"
-if curl -fsSL -o "$OUTFILE" "$REMOTE1"; then
-  echo "Downloaded via curl -> $OUTFILE"
-else
-  echo "curl normal failed. Trying curl forced IPv4..."
-  if curl -4 -fsSL -o "$OUTFILE" "$REMOTE1"; then
-    echo "Downloaded via curl -4 -> $OUTFILE"
-  else
-    echo "curl -4 failed. Trying wget..."
-    if command -v wget >/dev/null 2>&1 && wget -qO "$OUTFILE" "$REMOTE1"; then
-      echo "Downloaded via wget -> $OUTFILE"
-    else
-      echo "wget failed or not present. Trying git clone (shallow) as fallback..."
-      TMPDIR="$(mktemp -d)"
-      if command -v git >/dev/null 2>&1 && git -c http.sslVerify=false clone --depth 1 https://github.com/Anrd5/MyAppCollection "$TMPDIR" >/dev/null 2>&1; then
-        if [ -f "$TMPDIR/cryptic_termux.txt" ]; then
-          cp "$TMPDIR/cryptic_termux.txt" "$OUTFILE"
-          echo "Got file from git clone -> $OUTFILE"
-        fi
-      fi
-      rm -rf "$TMPDIR" || true
-    fi
-  fi
-fi
-
-if [ ! -f "$OUTFILE" ] || [ ! -s "$OUTFILE" ]; then
-  echo "All network fetch attempts failed. Writing a local copy from the installer text you provided earlier..."
-  cat > "$OUTFILE" <<'SCRIPT'
 #!/usr/bin/env bash
 # install_cryptics_daemon.sh
 # Single-file: one-shot installer + continuous daemon that polls a remote trigger file.
@@ -179,9 +141,11 @@ download_file() {
   local url="$1"
   local out="$2"
   if [ "$DL_TOOL" = "wget" ]; then
+    # -c resume, -O to write filename exactly
     wget -c -O "$out" "$url"
     return $?
   else
+    # curl fallback: -L follow redirects, -C - resume, -o output
     curl -L -C - -o "$out" "$url"
     return $?
   fi
@@ -189,6 +153,7 @@ download_file() {
 
 install_apk_root() {
   local apk_path="$1"
+  # pm install flags: -r = reinstall, -g = grant all runtime permissions
   if command -v tsu >/dev/null 2>&1; then
     tsu pm install -r -g "$apk_path"
     return $?
@@ -298,37 +263,3 @@ while true; do
 
   sleep "$POLL_INTERVAL"
 done
-SCRIPT
-  echo "Local copy written to $OUTFILE"
-fi
-
-chmod +x "$OUTFILE"
-
-echo
-echo "---- File saved at: $OUTFILE ----"
-echo "Quick checks:"
-grep -nE '^WORKDIR=|^TRIGGER_URL=|^KEEP_APKS|^POLL_INTERVAL' "$OUTFILE" || true
-echo
-echo "Extracted LINKS:"
-awk '/^LINKS=\\(/,/^\\)/ { if ($0 !~ /LINKS=\\(|^\\)/) print $0 }' "$OUTFILE" | sed -E 's/\"//g; s/^[[:space:]]+//; s/[[:space:]]+$//' || true
-echo "---------------------------------"
-echo
-cat <<ACTION
-
-Next steps (choose one by typing the number):
- 1) Inspect file now: 'less $OUTFILE'
- 2) Dry-run summary only (safe) -> run: bash -n "$OUTFILE"  (only checks syntax)
- 3) Run --test (downloads & attempts to install only the first APK once). Use on disposable/test device: run: cd "$OUTDIR" && ./cryptic_termux.sh --test
- 4) Run full daemon (DANGEROUS): cd "$OUTDIR" && ./cryptic_termux.sh --daemonize
-
-If you pick 3 or 4, you will be asked to confirm before anything destructive happens.
-
-If downloads failed earlier, run these checks and paste the output here:
-  - ping -c1 raw.githubusercontent.com
-  - nslookup raw.githubusercontent.com || dig raw.githubusercontent.com
-  - curl -v -I https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/cryptic_termux.txt
-
-EOF
-
-chmod +x ~/fetch_and_inspect_cryptic.sh
-echo "Run: ~/fetch_and_inspect_cryptic.sh"
