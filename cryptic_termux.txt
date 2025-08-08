@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# install_cryptics_daemon.sh
-# Single-file: one-shot installer + continuous daemon that polls a remote trigger file.
-# Includes: original 8 APK links, resume downloads, silent root installs (tsu/su),
-#          KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
+# install_cryptics_daemon_no_root.sh
+# Variant of original installer designed to run WITHOUT root.
+# - Downloads APKs (resume capable) and optionally attempts non-root pm installs (may fail)
+# - If no root is available, it preserves APKs for manual install and logs clear instructions
+# - Supports: KEEP_APKS, POLL_INTERVAL, TRIGGER_URL, --test, --daemonize, --pidfile, --logfile
 set -u
 
 # ----------------- Configuration (can be overridden with env vars) -----------------
-WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
-KEEP_APKS="${KEEP_APKS:-0}"   # set KEEP_APKS=1 to keep apk files
-POLL_INTERVAL="${POLL_INTERVAL:-30}"   # seconds between trigger checks
+# WORKDIR will be auto-chosen if not set: prefer writable /sdcard, then /data/local/tmp, then $HOME
+WORKDIR="${WORKDIR:-}"
+KEEP_APKS="${KEEP_APKS:-0}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
 TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
-STATE_FILE="${WORKDIR}/.last_refresh_state"
-PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
-LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
 
-# ----------------- The APK links (unchanged from your original) -----------------
+# We'll fill STATE_FILE/PIDFILE/LOGFILE after WORKDIR chosen
+
+# ----------------- The APK links (unchanged) -----------------
 LINKS=(
 "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
 "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
@@ -37,10 +38,10 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --daemonize           Run as background daemon (uses nohup, writes PID & log)
-  --pidfile <path>      Specify PID file (default: ${PIDFILE_DEFAULT})
-  --logfile <path>      Specify logfile (default: ${LOGFILE_DEFAULT})
-  --test                Test mode: download & install only the first APK once, then exit
+  --daemonize           Run as background daemon (uses nohup/setsid, writes PID & log)
+  --pidfile <path>      Specify PID file (default: <WORKDIR>/cryptic_daemon.pid)
+  --logfile <path>      Specify logfile (default: <HOME>/cryptic_daemon.log)
+  --test                Test mode: download (and try install if root) only the first APK once, then exit
   --help                Show this help and exit
 
 Environment variables:
@@ -49,7 +50,7 @@ Environment variables:
 Examples:
   $0 --test
   $0 --daemonize
-  POLL_INTERVAL=10 KEEP_APKS=1 $0 --daemonize --logfile /sdcard/cryptic_log.txt
+  WORKDIR=/sdcard/cryptic_apks ./install_cryptics_daemon_no_root.sh --test
 EOF
 }
 
@@ -68,6 +69,23 @@ while [ $i -le $# ]; do
   i=$((i+1))
 done
 
+# ----------------- Choose a writable WORKDIR when not provided -----------------
+if [ -z "${WORKDIR:-}" ]; then
+  if [ -d /sdcard ] && touch /sdcard/.writable_test 2>/dev/null; then
+    WORKDIR="/sdcard/cryptic_apks"
+    rm -f /sdcard/.writable_test 2>/dev/null || true
+  elif [ -d /data/local/tmp ] && touch /data/local/tmp/.writable_test 2>/dev/null; then
+    WORKDIR="/data/local/tmp/cryptic_apks"
+    rm -f /data/local/tmp/.writable_test 2>/dev/null || true
+  else
+    WORKDIR="${HOME}/cryptic_apks"
+  fi
+fi
+
+STATE_FILE="${WORKDIR}/.last_refresh_state"
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
 PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
 LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
 
@@ -77,7 +95,8 @@ cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
 
 log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
 
-# Daemonize: parent launches child with nohup and exits (child gets --child)
+# ----------------- Daemonize fallback: use setsid if nohup missing -----------------
+
 if [ "$DAEMONIZE" = 1 ]; then
   # If already running, exit
   if [ -f "$PIDFILE" ]; then
@@ -89,10 +108,18 @@ if [ "$DAEMONIZE" = 1 ]; then
       rm -f "$PIDFILE" 2>/dev/null || true
     fi
   fi
-  # Re-launch self with nohup into log
   mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
-  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
-  childpid=$!
+  if command -v nohup >/dev/null 2>&1; then
+    nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+    childpid=$!
+  elif command -v setsid >/dev/null 2>&1; then
+    setsid "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+    childpid=$!
+  else
+    # last resort: simple background
+    "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+    childpid=$!
+  fi
   echo "$childpid" > "$PIDFILE"
   echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
   exit 0
@@ -102,41 +129,43 @@ fi
 printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
 trap 'if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
 
-# ----------------- Downloader selection -----------------
+# ----------------- Downloader selection (no auto package installs) -----------------
 DL_TOOL=""
 if command -v wget >/dev/null 2>&1; then
   DL_TOOL="wget"
 elif command -v curl >/dev/null 2>&1; then
   DL_TOOL="curl"
 else
-  log "No wget/curl found. Attempting to install wget via pkg..."
-  pkg update -y >/dev/null 2>&1 || true
-  pkg install -y wget >/dev/null 2>&1 || true
-  if command -v wget >/dev/null 2>&1; then
-    DL_TOOL="wget"
-  elif command -v curl >/dev/null 2>&1; then
-    DL_TOOL="curl"
-  else
-    log "Failed to obtain wget/curl. Install one and re-run."
-    exit 1
-  fi
+  log "ERROR: No wget/curl found. Please install wget or curl in the VM image and re-run."
+  exit 1
 fi
 log "Using downloader: $DL_TOOL"
 
-# ----------------- Root helper -----------------
+# ----------------- Root detection (non-fatal) -----------------
+ROOT_AVAILABLE=0
 ROOT_CMD=""
 if command -v tsu >/dev/null 2>&1; then
   ROOT_CMD="tsu --"
+  ROOT_AVAILABLE=1
 elif command -v su >/dev/null 2>&1; then
   ROOT_CMD="su -c"
+  ROOT_AVAILABLE=1
 else
-  log "No root helper (tsu or su) found. Script requires root to install silently."
-  log "Install tsu (pkg install tsu) or ensure su is available, then re-run."
-  exit 1
+  ROOT_AVAILABLE=0
 fi
-log "Using root command: ${ROOT_CMD%% *}"
+if [ "$ROOT_AVAILABLE" -eq 1 ]; then
+  log "Root helper found: ${ROOT_CMD%% *} — will attempt silent installs"
+else
+  log "No root helper found. Script will download APKs and preserve them for manual install."
+  # If not root, force KEEP_APKS=1 so we don't delete APKs after (they're needed for manual install)
+  if [ "$KEEP_APKS" = "0" ]; then
+    log "Forcing KEEP_APKS=1 because no root is available."
+    KEEP_APKS=1
+  fi
+fi
 
-# ----------------- Core functions (kept from your original) -----------------
+# ----------------- Core functions -----------------
+
 download_file() {
   local url="$1"
   local out="$2"
@@ -151,15 +180,25 @@ download_file() {
   fi
 }
 
-install_apk_root() {
+install_apk() {
   local apk_path="$1"
-  # pm install flags: -r = reinstall, -g = grant all runtime permissions
-  if command -v tsu >/dev/null 2>&1; then
-    tsu pm install -r -g "$apk_path"
-    return $?
+  # If we have root helper, perform silent install
+  if [ "$ROOT_AVAILABLE" -eq 1 ]; then
+    if command -v tsu >/dev/null 2>&1; then
+      tsu pm install -r -g "$apk_path"
+      return $?
+    else
+      su -c "pm install -r -g '$apk_path'"
+      return $?
+    fi
+  fi
+
+  # No root: try non-root pm (this usually fails on modern Android), return codes:
+  # 0 = success, 1 = pm returned nonzero, 2 = pm not available
+  if command -v pm >/dev/null 2>&1; then
+    pm install -r -g "$apk_path" >/dev/null 2>&1 && return 0 || return 1
   else
-    su -c "pm install -r -g '$apk_path'"
-    return $?
+    return 2
   fi
 }
 
@@ -178,9 +217,9 @@ get_remote_flag() {
   esac
 }
 
-# ----------------- One run (the original loop) -----------------
+# ----------------- One run (download + optional install) -----------------
 do_downloads_and_installs() {
-  log "Starting downloads and installs into $WORKDIR"
+  log "Starting downloads (workdir=$WORKDIR)"
   log "----"
   for url in "${LINKS[@]}"; do
     fname="${url##*/}"
@@ -204,19 +243,26 @@ do_downloads_and_installs() {
     fi
 
     size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
-    log "Downloaded $fname (${size_bytes} bytes). Installing..."
-    install_apk_root "$PWD/$fname"
-    inst_rc=$?
-    if [ $inst_rc -eq 0 ]; then
-      log "Installed $fname successfully."
-      if [ "$KEEP_APKS" = "0" ]; then
-        log "Removing $fname to save space..."
-        rm -f "$fname"
+    log "Downloaded $fname (${size_bytes} bytes)."
+
+    if [ "$ROOT_AVAILABLE" -eq 1 ]; then
+      log "Attempting silent install of $fname"
+      install_apk "$PWD/$fname"
+      inst_rc=$?
+      if [ $inst_rc -eq 0 ]; then
+        log "Installed $fname successfully."
+        if [ "$KEEP_APKS" = "0" ]; then
+          log "Removing $fname to save space..."
+          rm -f "$fname"
+        else
+          log "Keeping $fname as requested (KEEP_APKS=1)."
+        fi
       else
-        log "Keeping $fname as requested (KEEP_APKS=1)."
+        log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging/manual install."
       fi
     else
-      log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging."
+      log "No root: skipping automatic install. APK available at: $PWD/$fname"
+      log "To install, either run: pm install -r -g $PWD/$fname (as root) or pull the file via ADB and install from a host."
     fi
   done
   log "All tasks finished. Workdir: $WORKDIR"
@@ -224,7 +270,7 @@ do_downloads_and_installs() {
 
 # ----------------- TEST mode: one-shot first APK -----------------
 if [ "$TEST_MODE" = 1 ]; then
-  log "TEST MODE: only downloading + installing the first APK once."
+  log "TEST MODE: only downloading (and attempting install if root) the first APK once."
   if [ ${#LINKS[@]} -gt 0 ]; then
     first="${LINKS[0]}"
     LINKS=("$first")
