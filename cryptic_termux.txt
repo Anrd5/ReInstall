@@ -1,30 +1,18 @@
 #!/usr/bin/env bash
-# install_cryptics_daemon_vmos_ready.sh
-# Modified from original to better support VMOS (device & cloud) and generic Android shells.
+# install_cryptics_daemon.sh
 # Single-file: one-shot installer + continuous daemon that polls a remote trigger file.
-# Features added:
-#  - VMOS detection and special handling (workdir fallback, root helper checks)
-#  - More portable date/logging, downloader fallbacks (busybox), safer daemonize when nohup missing
-#  - Better pm install fallback sequence (user 0, copy to /data/local/tmp)
-#  - Avoids Termux-only "pkg install" attempts on plain Android
-#  - Keeps original CLI flags and behavior
+# Includes: original 8 APK links, resume downloads, silent root installs (tsu/su),
+#          KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
 set -u
 
 # ----------------- Configuration (can be overridden with env vars) -----------------
-# Default WORKDIR: prefer $WORKDIR env if provided; otherwise try $HOME, fallback to /sdcard
-if [ -n "${WORKDIR:-}" ]; then
-  WORKDIR="$WORKDIR"
-elif [ -n "${HOME:-}" ] && [ -w "$HOME" ]; then
-  WORKDIR="${HOME%/}/cryptic_apks"
-else
-  WORKDIR="/sdcard/cryptic_apks"
-fi
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
 KEEP_APKS="${KEEP_APKS:-0}"   # set KEEP_APKS=1 to keep apk files
 POLL_INTERVAL="${POLL_INTERVAL:-30}"   # seconds between trigger checks
 TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
-STATE_FILE="${STATE_FILE:-$WORKDIR/.last_refresh_state}"
-PIDFILE_DEFAULT="${PIDFILE_DEFAULT:-$WORKDIR/cryptic_daemon.pid}"
-LOGFILE_DEFAULT="${LOGFILE_DEFAULT:-/sdcard/cryptic_daemon.log}"
+STATE_FILE="${WORKDIR}/.last_refresh_state"
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
 
 # ----------------- The APK links (unchanged from your original) -----------------
 LINKS=(
@@ -49,7 +37,7 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --daemonize           Run as background daemon (uses nohup or shell background)
+  --daemonize           Run as background daemon (uses nohup, writes PID & log)
   --pidfile <path>      Specify PID file (default: ${PIDFILE_DEFAULT})
   --logfile <path>      Specify logfile (default: ${LOGFILE_DEFAULT})
   --test                Test mode: download & install only the first APK once, then exit
@@ -84,32 +72,12 @@ PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
 LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
 
 # ----------------- Helpers -----------------
-mkdir -p "$WORKDIR" 2>/dev/null || true
+mkdir -p "$WORKDIR"
 cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
 
-log() {
-  # more portable timestamp (Android busybox date may not support --iso-8601)
-  ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)"
-  printf '[%s] %s\n' "$ts" "$*"
-}
+log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
 
-# ----------------- VMOS detection -----------------
-IS_VMOS=0
-VMOS_PROP=""
-if command -v getprop >/dev/null 2>&1; then
-  VMOS_PROP="$(getprop ro.vmos.version 2>/dev/null || true)"
-  if [ -n "$VMOS_PROP" ]; then
-    IS_VMOS=1
-  else
-    # fallback: manufacturer/product contains vmos
-    manu="$(getprop ro.product.manufacturer 2>/dev/null || true)"
-    if printf '%s' "$manu" | tr '[:upper:]' '[:lower:]' | grep -q vmos; then
-      IS_VMOS=1
-    fi
-  fi
-fi
-
-# ----------------- Daemonize: parent launches child with nohup and exits (child gets --child)
+# Daemonize: parent launches child with nohup and exits (child gets --child)
 if [ "$DAEMONIZE" = 1 ]; then
   # If already running, exit
   if [ -f "$PIDFILE" ]; then
@@ -121,79 +89,63 @@ if [ "$DAEMONIZE" = 1 ]; then
       rm -f "$PIDFILE" 2>/dev/null || true
     fi
   fi
+  # Re-launch self with nohup into log
   mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
-  if command -v nohup >/dev/null 2>&1; then
-    nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
-    childpid=$!
-    echo "$childpid" > "$PIDFILE"
-    echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
-    exit 0
-  else
-    # More portable background method when nohup isn't present (Android shells)
-    # Start the script in background and capture its PID into PIDFILE.
-    sh -c "\"$0\" --pidfile \"$PIDFILE\" --logfile \"$LOGFILE\" > \"$LOGFILE\" 2>&1 & echo \$! > \"$PIDFILE\""
-    sleep 0.5
-    childpid="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [ -n "$childpid" ]; then
-      echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
-      exit 0
-    else
-      echo "Failed to daemonize (nohup missing and fallback failed). Run in foreground instead." >&2
-      # continue running in foreground
-    fi
-  fi
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
+  exit 0
 fi
 
 # If running (foreground/child) write PID file
-printf '%s' "$$(ps -o pid= -p $$ 2>/dev/null || echo $$)" > "$PIDFILE" 2>/dev/null || true
+printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
 trap 'if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
 
 # ----------------- Downloader selection -----------------
 DL_TOOL=""
-DL_CMD=""
 if command -v wget >/dev/null 2>&1; then
   DL_TOOL="wget"
 elif command -v curl >/dev/null 2>&1; then
   DL_TOOL="curl"
-elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -q '^wget$'; then
-  DL_TOOL="busybox_wget"
 else
-  log "No wget/curl/busybox-wget found. Please install one (Termux: pkg install wget or curl)."
-  exit 1
+  log "No wget/curl found. Attempting to install wget via pkg..."
+  pkg update -y >/dev/null 2>&1 || true
+  pkg install -y wget >/dev/null 2>&1 || true
+  if command -v wget >/dev/null 2>&1; then
+    DL_TOOL="wget"
+  elif command -v curl >/dev/null 2>&1; then
+    DL_TOOL="curl"
+  else
+    log "Failed to obtain wget/curl. Install one and re-run."
+    exit 1
+  fi
 fi
 log "Using downloader: $DL_TOOL"
 
 # ----------------- Root helper -----------------
 ROOT_CMD=""
-ROOT_HELPER_NAME=""
-# Order: tsu, vmos-su, su
 if command -v tsu >/dev/null 2>&1; then
   ROOT_CMD="tsu --"
-  ROOT_HELPER_NAME="tsu"
-elif command -v vmos-su >/dev/null 2>&1; then
-  ROOT_CMD="vmos-su -c"
-  ROOT_HELPER_NAME="vmos-su"
 elif command -v su >/dev/null 2>&1; then
   ROOT_CMD="su -c"
-  ROOT_HELPER_NAME="su"
 else
-  log "No root helper (tsu, vmos-su or su) found. Script requires root to install silently."
-  log "If using VMOS Cloud make sure the VM has root enabled; if you're on device install a su binary or tsu." 
+  log "No root helper (tsu or su) found. Script requires root to install silently."
+  log "Install tsu (pkg install tsu) or ensure su is available, then re-run."
   exit 1
 fi
-log "Using root helper: $ROOT_HELPER_NAME (IS_VMOS=$IS_VMOS)"
+log "Using root command: ${ROOT_CMD%% *}"
 
-# ----------------- Core functions -----------------
+# ----------------- Core functions (kept from your original) -----------------
 download_file() {
   local url="$1"
   local out="$2"
   if [ "$DL_TOOL" = "wget" ]; then
+    # -c resume, -O to write filename exactly
     wget -c -O "$out" "$url"
     return $?
-  elif [ "$DL_TOOL" = "busybox_wget" ]; then
-    busybox wget -c -O "$out" "$url"
-    return $?
   else
+    # curl fallback: -L follow redirects, -C - resume, -o output
     curl -L -C - -o "$out" "$url"
     return $?
   fi
@@ -201,40 +153,14 @@ download_file() {
 
 install_apk_root() {
   local apk_path="$1"
-  local rc=1
-
-  # Try direct pm install with user 0 (common requirement on newer Android)
-  if printf '%s' "$ROOT_CMD" | grep -q tsu; then
-    # tsu supports direct invocation
-    $ROOT_CMD pm install -r -g --user 0 "$apk_path" >/dev/null 2>&1 && rc=0 || true
+  # pm install flags: -r = reinstall, -g = grant all runtime permissions
+  if command -v tsu >/dev/null 2>&1; then
+    tsu pm install -r -g "$apk_path"
+    return $?
   else
-    # su -c style
-    $ROOT_CMD "pm install -r -g --user 0 '$apk_path'" >/dev/null 2>&1 && rc=0 || true
+    su -c "pm install -r -g '$apk_path'"
+    return $?
   fi
-
-  # Fallback: try without --user 0
-  if [ $rc -ne 0 ]; then
-    if printf '%s' "$ROOT_CMD" | grep -q tsu; then
-      $ROOT_CMD pm install -r -g "$apk_path" >/dev/null 2>&1 && rc=0 || true
-    else
-      $ROOT_CMD "pm install -r -g '$apk_path'" >/dev/null 2>&1 && rc=0 || true
-    fi
-  fi
-
-  # Final fallback: copy to /data/local/tmp, set perms and install from there
-  if [ $rc -ne 0 ]; then
-    tmpdest="/data/local/tmp/$(basename "$apk_path")"
-    cp -f "$apk_path" "$tmpdest" 2>/dev/null || true
-    chmod 0644 "$tmpdest" 2>/dev/null || true
-    if printf '%s' "$ROOT_CMD" | grep -q tsu; then
-      $ROOT_CMD pm install -r -g --user 0 "$tmpdest" >/dev/null 2>&1 && rc=0 || true
-    else
-      $ROOT_CMD "pm install -r -g --user 0 '$tmpdest'" >/dev/null 2>&1 && rc=0 || true
-    fi
-    # don't aggressively remove tmpdest here; keep it small
-  fi
-
-  return $rc
 }
 
 # ----------------- Trigger fetch -----------------
@@ -242,12 +168,9 @@ get_remote_flag() {
   local content=""
   if [ "$DL_TOOL" = "wget" ]; then
     content="$(wget -qO- "$TRIGGER_URL" 2>/dev/null || true)"
-  elif [ "$DL_TOOL" = "busybox_wget" ]; then
-    content="$(busybox wget -qO- "$TRIGGER_URL" 2>/dev/null || true)"
   else
     content="$(curl -fsSL "$TRIGGER_URL" 2>/dev/null || true)"
   fi
-  # trim whitespace/newlines and get first char
   content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
   case "$content" in
     0|1) printf '%s' "$content" ;;
@@ -280,37 +203,20 @@ do_downloads_and_installs() {
       continue
     fi
 
-    # get size in bytes (portable fallback)
-    if stat -c%s "$fname" >/dev/null 2>&1; then
-      size_bytes=$(stat -c%s "$fname" 2>/dev/null || true)
-    else
-      size_bytes=$(wc -c < "$fname" 2>/dev/null || true)
-    fi
+    size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
     log "Downloaded $fname (${size_bytes} bytes). Installing..."
-
-    # If on VMOS/Cloud sometimes installing from /data/local/tmp is more reliable
-    if [ "$IS_VMOS" -eq 1 ]; then
-      # copy to /data/local/tmp first
-      cp -f "$fname" "/data/local/tmp/$fname" 2>/dev/null || true
-      inst_path="/data/local/tmp/$fname"
-    else
-      inst_path="$PWD/$fname"
-    fi
-
-    install_apk_root "$inst_path"
+    install_apk_root "$PWD/$fname"
     inst_rc=$?
     if [ $inst_rc -eq 0 ]; then
       log "Installed $fname successfully."
       if [ "$KEEP_APKS" = "0" ]; then
         log "Removing $fname to save space..."
-        rm -f "$fname" 2>/dev/null || true
-        # also remove tmp copy
-        [ -f "/data/local/tmp/$fname" ] && rm -f "/data/local/tmp/$fname" 2>/dev/null || true
+        rm -f "$fname"
       else
         log "Keeping $fname as requested (KEEP_APKS=1)."
       fi
     else
-      log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging." 
+      log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging."
     fi
   done
   log "All tasks finished. Workdir: $WORKDIR"
@@ -334,7 +240,7 @@ if [ -f "$STATE_FILE" ]; then
 fi
 last_state="${last_state:-}"
 
-log "Daemon starting. Polling $TRIGGER_URL every ${POLL_INTERVAL}s. Initial last_state='$last_state'. Logfile: ${LOGFILE}. VMOS=$IS_VMOS"
+log "Daemon starting. Polling $TRIGGER_URL every ${POLL_INTERVAL}s. Initial last_state='$last_state'. Logfile: ${LOGFILE}"
 
 while true; do
   remote="$(get_remote_flag)"
