@@ -1,0 +1,200 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Cryptic auto-downloader/installer for Termux (unrooted-friendly)
+# - Watches RefreshClones.txt for a 0->1 toggle (edge-triggered)
+# - On 1, downloads Cryptic0..Cryptic7 APKs (if present) and installs them
+# - Requires "Install unknown apps" enabled for Termux for GUI installs
+# - Runs continuously; to re-run, set RefreshClones.txt to 0, then back to 1
+
+set -Eeuo pipefail
+
+# --- Config you can tweak ---
+REPO_USER="Anrd5"
+REPO_NAME="MyAppCollection"
+BRANCH="main"
+
+# Check interval in seconds (override with: export CRON_INTERVAL=60 before starting)
+SLEEP_SECS="${CRON_INTERVAL:-300}"
+
+# Where APKs live locally
+APK_DIR="$HOME/cryptic_apks"
+
+# Trigger button file (local). If missing, will be initialized.
+REF_LOCAL="$HOME/RefreshClones.txt"
+
+# Optional remote trigger fallback (read-only)
+RAW_BASE="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/refs/heads/${BRANCH}"
+REF_REMOTE="${RAW_BASE}/RefreshClones.txt"
+
+# Optional URL manifest listing direct APK URLs (one per line).
+MANIFEST_URL="${RAW_BASE}/cryptic_urls.txt"
+
+# State + log
+STATE_FILE="$HOME/.cryptic_state"
+LOG_FILE="$HOME/cryptic_install.log"
+# --- End config ---
+
+mkdir -p "$APK_DIR"
+
+log() {
+  printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*" | tee -a "$LOG_FILE" >&2
+}
+
+trim_num01() {
+  # Keep only first digit (0 or 1); default to 0
+  tr -cd '01' | head -c 1 || true
+}
+
+url_ok() {
+  local url="$1"
+  local code
+  code="$(curl -sIL -o /dev/null -w '%{http_code}' "$url" || true)"
+  [ "$code" = "200" ]
+}
+
+discover_urls() {
+  # 1) If a manifest exists, use it (ignoring comments/blank lines)
+  if url_ok "$MANIFEST_URL"; then
+    curl -fsSL "$MANIFEST_URL" | sed 's/#.*$//' | awk 'NF'
+    return 0
+  fi
+
+  # 2) Otherwise, try common locations/names: Cryptic0..Cryptic7 at repo root or common subfolders
+  local bases=("" "cryptic" "apks" "Apks" "APK" "APK/Cryptic")
+  local names
+  local i base name u
+
+  for i in $(seq 0 7); do
+    names=("Cryptic${i}.apk" "Cryptic${i}-release.apk" "Cryptic${i}-unsigned.apk")
+    for base in "${bases[@]}"; do
+      for name in "${names[@]}"; do
+        u="${RAW_BASE}/${base:+$base/}${name}"
+        if url_ok "$u"; then
+          echo "$u"
+          break
+        fi
+      done
+    done
+  done
+}
+
+get_ref_val() {
+  local val=""
+  if [ -f "$REF_LOCAL" ]; then
+    val="$(head -n1 "$REF_LOCAL" | trim_num01)"
+  else
+    if url_ok "$REF_REMOTE"; then
+      val="$(curl -fsSL "$REF_REMOTE" | head -n1 | trim_num01)"
+    fi
+    : "${val:=0}"
+    printf '%s\n' "$val" >"$REF_LOCAL"
+  fi
+  : "${val:=0}"
+  printf '%s\n' "$val"
+}
+
+get_state() {
+  if [ -f "$STATE_FILE" ]; then
+    head -n1 "$STATE_FILE" | trim_num01
+  else
+    echo 0
+  fi
+}
+
+set_state() {
+  echo "$1" >"$STATE_FILE"
+}
+
+download_all() {
+  local urls=("$@")
+  local any=0
+  if [ "${#urls[@]}" -eq 0 ]; then
+    log "No Cryptic APK URLs discovered."
+    return 1
+  fi
+  for url in "${urls[@]}"; do
+    local fn="$APK_DIR/$(basename "$url")"
+    log "Downloading $(basename "$url") ..."
+    if curl -fL --retry 3 --retry-delay 2 -o "$fn" "$url"; then
+      log "Saved: $fn"
+      any=1
+    else
+      log "Failed to download: $url"
+    fi
+  done
+  [ "$any" -eq 1 ]
+}
+
+attempt_pm_install() {
+  # Silent install usually requires adb shell or root; we try pm, then fall back to GUI installer.
+  local apk="$1"
+  if command -v pm >/dev/null 2>&1; then
+    if pm install -r "$apk" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+launch_gui_install() {
+  # Triggers Android’s Package Installer UI; you must confirm on-device.
+  local apk="$1"
+  if command -v termux-open >/dev/null 2>&1; then
+    termux-open "$apk" >/dev/null 2>&1 || true
+  else
+    am start -a android.intent.action.VIEW -d "file://$apk" -t "application/vnd.android.package-archive" >/dev/null 2>&1 || true
+  fi
+}
+
+install_all() {
+  shopt -s nullglob
+  local apk installed_any=0
+  for apk in "$APK_DIR"/Cryptic*.apk; do
+    log "Installing $(basename "$apk") ..."
+    if attempt_pm_install "$apk"; then
+      log "Installed via pm: $(basename "$apk")"
+      installed_any=1
+    else
+      log "Opening Package Installer UI for $(basename "$apk") — please confirm on device."
+      launch_gui_install "$apk"
+      installed_any=1
+    fi
+  done
+  shopt -u nullglob
+  [ "$installed_any" -eq 1 ]
+}
+
+main_once() {
+  mapfile -t urls < <(discover_urls | awk 'NF')
+  if [ "${#urls[@]}" -eq 0 ]; then
+    log "No APK URLs found. Add cryptic_urls.txt in the repo or place APKs at known paths."
+  fi
+  download_all "${urls[@]}" || true
+  install_all || true
+}
+
+log "Cryptic watcher started."
+log "Trigger file: $REF_LOCAL"
+log "APK directory: $APK_DIR"
+log "Log file: $LOG_FILE"
+
+# Initialize state coherently with current trigger
+cur_ref="$(get_ref_val)"
+set_state "$( [ "$cur_ref" = "1" ] && echo 1 || echo 0 )"
+
+# Main watch loop
+while :; do
+  cur_ref="$(get_ref_val)"
+  prev_state="$(get_state)"
+
+  if [ "$cur_ref" = "1" ] && [ "$prev_state" != "1" ]; then
+    log "Trigger detected (0 -> 1). Downloading and installing Cryptic clones..."
+    main_once
+    set_state "1"
+    log "Completed. To run again, set RefreshClones.txt to 0, then back to 1."
+  elif [ "$cur_ref" = "0" ] && [ "$prev_state" != "0" ]; then
+    set_state "0"
+    log "Reset detected (1 -> 0). Ready for next run."
+  fi
+
+  sleep "$SLEEP_SECS"
+done
