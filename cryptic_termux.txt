@@ -1,29 +1,41 @@
 #!/usr/bin/env bash
 # install_cryptics_daemon.sh
-# Single-file: one-shot installer + continuous daemon that polls a remote trigger file.
-# Includes: original 8 APK links, resume downloads, silent root installs (tsu/su),
-#          KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
-set -u
+# One-shot installer + daemon that polls a remote trigger file to install APKs.
+# Features:
+# - 8 APK links (unchanged)
+# - Resume downloads (wget -c / curl -C -)
+# - Silent installs via root (su -c preferred, then tsu -c), never interactive
+# - KEEP_APKS support
+# - CLI: --test, --daemonize, --pidfile, --logfile, --help
+# - PID + state files
+#
+# Notes:
+# - Fixes the "root:/ #" drop by ensuring all root calls are non-interactive (-c).
+# - Uses a single run-as-root helper so we never accidentally spawn a root shell.
+# - If both su and tsu exist, prefers su -c (Magisk) to avoid tsu variants that open shells.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
 
 # ----------------- Configuration (can be overridden with env vars) -----------------
 WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
-KEEP_APKS="${KEEP_APKS:-0}"   # set KEEP_APKS=1 to keep apk files
-POLL_INTERVAL="${POLL_INTERVAL:-30}"   # seconds between trigger checks
+KEEP_APKS="${KEEP_APKS:-0}"                 # set KEEP_APKS=1 to keep apk files after install
+POLL_INTERVAL="${POLL_INTERVAL:-30}"        # seconds between trigger checks
 TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
 STATE_FILE="${WORKDIR}/.last_refresh_state"
 PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
 LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
 
-# ----------------- The APK links (unchanged from your original) -----------------
+# ----------------- The APK links (unchanged) -----------------
 LINKS=(
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
-"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
 )
 
 # ----------------- CLI parsing -----------------
@@ -37,10 +49,10 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --daemonize           Run as background daemon (uses nohup, writes PID & log)
-  --pidfile <path>      Specify PID file (default: ${PIDFILE_DEFAULT})
-  --logfile <path>      Specify logfile (default: ${LOGFILE_DEFAULT})
-  --test                Test mode: download & install only the first APK once, then exit
+  --daemonize           Run as background daemon (nohup; writes PID & log)
+  --pidfile <path>      PID file (default: ${PIDFILE_DEFAULT})
+  --logfile <path>      Log file (default: ${LOGFILE_DEFAULT})
+  --test                Download & install only the first APK once, then exit
   --help                Show this help and exit
 
 Environment variables:
@@ -53,16 +65,15 @@ Examples:
 EOF
 }
 
-# Simple args loop
 i=1
 while [ $i -le $# ]; do
   arg="${!i}"
   case "$arg" in
     --daemonize) DAEMONIZE=1 ;;
-    --pidfile) i=$((i+1)); PIDFILE="${!i:-}";;
-    --logfile) i=$((i+1)); LOGFILE="${!i:-}";;
-    --test) TEST_MODE=1 ;;
-    --help|-h) usage; exit 0 ;;
+    --pidfile)   i=$((i+1)); PIDFILE="${!i:-}";;
+    --logfile)   i=$((i+1)); LOGFILE="${!i:-}";;
+    --test)      TEST_MODE=1 ;;
+    --help|-h)   usage; exit 0 ;;
     *) echo "Unknown option: $arg"; usage; exit 1 ;;
   esac
   i=$((i+1))
@@ -75,32 +86,42 @@ LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
 
-log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
+log() {
+  # Prefer ISO timestamp if available
+  local ts
+  ts="$(date --iso-8601=seconds 2>/dev/null || date)"
+  printf '[%s] %s\n' "$ts" "$*"
+}
 
-# Daemonize: parent launches child with nohup and exits (child gets --child)
+# ----------------- Daemonize -----------------
 if [ "$DAEMONIZE" = 1 ]; then
   # If already running, exit
   if [ -f "$PIDFILE" ]; then
     oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+    if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
       echo "Daemon already running (PID $oldpid). Exiting."
       exit 0
     else
       rm -f "$PIDFILE" 2>/dev/null || true
     fi
   fi
-  # Re-launch self with nohup into log
   mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
-  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" >"$LOGFILE" 2>&1 &
   childpid=$!
-  echo "$childpid" > "$PIDFILE"
+  echo "$childpid" >"$PIDFILE"
   echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
   exit 0
 fi
 
-# If running (foreground/child) write PID file
-printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
-trap 'if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
+# Write our PID and ensure cleanup
+printf '%s' "$$" >"$PIDFILE" 2>/dev/null || true
+cleanup() {
+  if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null || echo x)" = "$$" ]; then
+    rm -f "$PIDFILE"
+  fi
+  log "Exiting"
+}
+trap cleanup SIGINT SIGTERM EXIT
 
 # ----------------- Downloader selection -----------------
 DL_TOOL=""
@@ -109,9 +130,12 @@ if command -v wget >/dev/null 2>&1; then
 elif command -v curl >/dev/null 2>&1; then
   DL_TOOL="curl"
 else
-  log "No wget/curl found. Attempting to install wget via pkg..."
-  pkg update -y >/dev/null 2>&1 || true
-  pkg install -y wget >/dev/null 2>&1 || true
+  log "No wget/curl found."
+  if command -v pkg >/dev/null 2>&1; then
+    log "Attempting to install wget via pkg..."
+    pkg update -y >/dev/null 2>&1 || true
+    pkg install -y wget >/dev/null 2>&1 || true
+  fi
   if command -v wget >/dev/null 2>&1; then
     DL_TOOL="wget"
   elif command -v curl >/dev/null 2>&1; then
@@ -123,44 +147,54 @@ else
 fi
 log "Using downloader: $DL_TOOL"
 
-# ----------------- Root helper -----------------
-ROOT_CMD=""
-if command -v tsu >/dev/null 2>&1; then
-  ROOT_CMD="tsu --"
-elif command -v su >/dev/null 2>&1; then
-  ROOT_CMD="su -c"
-else
-  log "No root helper (tsu or su) found. Script requires root to install silently."
-  log "Install tsu (pkg install tsu) or ensure su is available, then re-run."
-  exit 1
-fi
-log "Using root command: ${ROOT_CMD%% *}"
-
-# ----------------- Core functions (kept from your original) -----------------
 download_file() {
   local url="$1"
   local out="$2"
   if [ "$DL_TOOL" = "wget" ]; then
-    # -c resume, -O to write filename exactly
-    wget -c -O "$out" "$url"
-    return $?
+    wget --tries=3 --timeout=20 -c -O "$out" "$url"
   else
-    # curl fallback: -L follow redirects, -C - resume, -o output
-    curl -L -C - -o "$out" "$url"
-    return $?
+    # curl: -f fail on 4xx/5xx, -L follow redirects, -C - resume, --retry
+    curl -fL --retry 3 --retry-delay 2 -C - -o "$out" "$url"
+  fi
+}
+
+# ----------------- Root execution (non-interactive) -----------------
+ROOT_IMPL=""
+if command -v su >/dev/null 2>&1; then
+  ROOT_IMPL="su"     # Prefer su -c (Magisk)
+elif command -v tsu >/dev/null 2>&1; then
+  ROOT_IMPL="tsu"    # Fallback to tsu -c (Termux root)
+else
+  log "No root helper found (su/tsu). Silent installs require root."
+  log "Install Magisk su or Termux tsu, then re-run."
+  exit 1
+fi
+log "Using root helper: $ROOT_IMPL"
+
+shell_quote() {
+  # Single-quote a string for the shell, safe for paths with spaces
+  # Usage: shell_quote "$var" -> outputs 'escaped'
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+
+run_as_root() {
+  # Always non-interactive. Never spawn an interactive root shell.
+  # Usage: run_as_root "command with args"
+  if [ "$ROOT_IMPL" = "su" ]; then
+    su -c "$*"
+  else
+    # Many tsu versions support -c; using it prevents dropping into a root shell
+    tsu -c "$*"
   fi
 }
 
 install_apk_root() {
   local apk_path="$1"
-  # pm install flags: -r = reinstall, -g = grant all runtime permissions
-  if command -v tsu >/dev/null 2>&1; then
-    tsu pm install -r -g "$apk_path"
-    return $?
-  else
-    su -c "pm install -r -g '$apk_path'"
-    return $?
-  fi
+  local qpath
+  qpath="$(shell_quote "$apk_path")"
+  # Prefer 'cmd package' (Android 7+) with fallback to 'pm'
+  local cmd_str="cmd package install -r -g ${qpath} || pm install -r -g ${qpath}"
+  run_as_root "$cmd_str"
 }
 
 # ----------------- Trigger fetch -----------------
@@ -178,23 +212,22 @@ get_remote_flag() {
   esac
 }
 
-# ----------------- One run (the original loop) -----------------
+# ----------------- Main work -----------------
 do_downloads_and_installs() {
   log "Starting downloads and installs into $WORKDIR"
   log "----"
   for url in "${LINKS[@]}"; do
     fname="${url##*/}"
-    log "Processing: $fname"
+
+    # Clean zero-byte file if present
     if [ -f "$fname" ] && [ ! -s "$fname" ]; then
       log "Removing zero-size stale file $fname"
       rm -f "$fname"
     fi
 
-    log "Downloading from: $url"
-    download_file "$url" "$fname"
-    dlrc=$?
-    if [ $dlrc -ne 0 ]; then
-      log "Error: download failed for $fname (code $dlrc). Skipping."
+    log "Downloading: $url"
+    if ! download_file "$url" "$fname"; then
+      log "Error: download failed for $fname. Skipping."
       continue
     fi
 
@@ -203,61 +236,61 @@ do_downloads_and_installs() {
       continue
     fi
 
-    size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
+    # Size logging
+    size_bytes="$( (stat -c%s "$fname" 2>/dev/null) || (ls -l "$fname" | awk '{print $5}') || echo "?")"
     log "Downloaded $fname (${size_bytes} bytes). Installing..."
-    install_apk_root "$PWD/$fname"
-    inst_rc=$?
-    if [ $inst_rc -eq 0 ]; then
+
+    if install_apk_root "$PWD/$fname"; then
       log "Installed $fname successfully."
-      if [ "$KEEP_APKS" = "0" ]; then
+      if [ "${KEEP_APKS}" = "0" ]; then
         log "Removing $fname to save space..."
-        rm -f "$fname"
+        rm -f "$fname" || true
       else
         log "Keeping $fname as requested (KEEP_APKS=1)."
       fi
     else
-      log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging."
+      rc=$?
+      log "Warning: installation failed for $fname (exit $rc). File kept for debugging."
     fi
   done
   log "All tasks finished. Workdir: $WORKDIR"
 }
 
-# ----------------- TEST mode: one-shot first APK -----------------
+# ----------------- TEST mode -----------------
 if [ "$TEST_MODE" = 1 ]; then
   log "TEST MODE: only downloading + installing the first APK once."
   if [ ${#LINKS[@]} -gt 0 ]; then
-    first="${LINKS[0]}"
-    LINKS=("$first")
+    LINKS=("${LINKS[0]}")
   fi
   do_downloads_and_installs
   exit 0
 fi
 
-# ----------------- Daemon loop: watch trigger and run on 0->1 transition -----------------
+# ----------------- Daemon loop -----------------
 last_state=""
 if [ -f "$STATE_FILE" ]; then
   last_state="$(cat "$STATE_FILE" 2>/dev/null || true)"
 fi
 last_state="${last_state:-}"
 
-log "Daemon starting. Polling $TRIGGER_URL every ${POLL_INTERVAL}s. Initial last_state='$last_state'. Logfile: ${LOGFILE}"
+log "Daemon starting. Polling $TRIGGER_URL every ${POLL_INTERVAL}s. Initial last_state='${last_state}'. Logfile: ${LOGFILE}"
 
 while true; do
   remote="$(get_remote_flag)"
   if [ -z "$remote" ]; then
-    log "Warning: could not fetch remote trigger (network issue or unexpected content). Will retry in ${POLL_INTERVAL}s."
+    log "Warning: could not fetch remote trigger (network issue or unexpected content). Retrying in ${POLL_INTERVAL}s."
     sleep "$POLL_INTERVAL"
     continue
   fi
 
   if [ "$remote" != "$last_state" ]; then
-    log "Remote state changed: '$last_state' -> '$remote'"
+    log "Remote state changed: '${last_state}' -> '${remote}'"
     if [ "$remote" = "1" ]; then
       do_downloads_and_installs
     else
       log "Remote is '0' — idle."
     fi
-    printf '%s' "$remote" > "$STATE_FILE"
+    printf '%s' "$remote" >"$STATE_FILE"
     last_state="$remote"
   fi
 
