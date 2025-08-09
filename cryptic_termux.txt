@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
-# install_cryptics_daemon.sh (VMOS Cloud–tuned)
-# One-shot installer + daemon polling a remote trigger.
-# Fixes: tsu usage, Android 13 'cmd package' install, root checks, clean logging.
-
+# install_cryptics_daemon.sh
+# Installer + daemon for downloading and silently installing APKs on Android (Termux).
 set -u
 
-# ----------------- Configuration (can be overridden with env vars) -----------------
+# ----------------- Configuration -----------------
 WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
-KEEP_APKS="${KEEP_APKS:-0}"                 # set KEEP_APKS=1 to keep apk files
-POLL_INTERVAL="${POLL_INTERVAL:-30}"        # seconds between trigger checks
+KEEP_APKS="${KEEP_APKS:-0}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
 TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
 STATE_FILE="${WORKDIR}/.last_refresh_state"
 PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
 LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
 
-# ----------------- The APK links -----------------
 LINKS=(
 "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
 "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
@@ -26,7 +23,7 @@ LINKS=(
 "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
 )
 
-# ----------------- CLI parsing -----------------
+# ----------------- CLI Parsing -----------------
 DAEMONIZE=0
 TEST_MODE=0
 PIDFILE=""
@@ -37,13 +34,13 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --daemonize           Run as background daemon (uses nohup, writes PID & log)
-  --pidfile <path>      Specify PID file (default: ${PIDFILE_DEFAULT})
-  --logfile <path>      Specify logfile (default: ${LOGFILE_DEFAULT})
-  --test                Test mode: download & install only the first APK once, then exit
-  --help                Show this help and exit
+  --daemonize           Run as background daemon
+  --pidfile <path>      PID file (default: ${PIDFILE_DEFAULT})
+  --logfile <path>      Log file (default: ${LOGFILE_DEFAULT})
+  --test                Test mode: download & install first APK only
+  --help                Show this help
 
-Environment variables:
+Environment:
   WORKDIR, KEEP_APKS, POLL_INTERVAL, TRIGGER_URL
 
 Examples:
@@ -58,10 +55,10 @@ while [ $i -le $# ]; do
   arg="${!i}"
   case "$arg" in
     --daemonize) DAEMONIZE=1 ;;
-    --pidfile)   i=$((i+1)); PIDFILE="${!i:-}" ;;
-    --logfile)   i=$((i+1)); LOGFILE="${!i:-}" ;;
-    --test)      TEST_MODE=1 ;;
-    --help|-h)   usage; exit 0 ;;
+    --pidfile) i=$((i+1)); PIDFILE="${!i:-}";;
+    --logfile) i=$((i+1)); LOGFILE="${!i:-}";;
+    --test) TEST_MODE=1 ;;
+    --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $arg"; usage; exit 1 ;;
   esac
   i=$((i+1))
@@ -70,15 +67,20 @@ done
 PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
 LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
 
-# ----------------- Helpers -----------------
+# ----------------- Setup -----------------
 mkdir -p "$WORKDIR"
 cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
 
 log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
 
-SCRIPT_PATH="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+ANDROID_VERSION="$(getprop ro.build.version.release 2>/dev/null || echo 'Unknown')"
+log "Detected Android version: $ANDROID_VERSION"
 
-# Daemonize: parent launches child with nohup and exits
+if [ ! -d "$HOME/storage" ]; then
+  log "Termux storage not initialized. Run: termux-setup-storage"
+fi
+
+# ----------------- Daemonize -----------------
 if [ "$DAEMONIZE" = 1 ]; then
   if [ -f "$PIDFILE" ]; then
     oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
@@ -90,95 +92,73 @@ if [ "$DAEMONIZE" = 1 ]; then
     fi
   fi
   mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
-  nohup "$SCRIPT_PATH" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
   childpid=$!
   echo "$childpid" > "$PIDFILE"
-  echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
+  echo "Started daemon (PID $childpid). Log: $LOGFILE"
   exit 0
 fi
 
 printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
 trap 'if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
 
-# ----------------- Downloader selection -----------------
+# ----------------- Downloader -----------------
 DL_TOOL=""
 if command -v wget >/dev/null 2>&1; then
   DL_TOOL="wget"
 elif command -v curl >/dev/null 2>&1; then
   DL_TOOL="curl"
 else
-  log "No wget/curl found. Attempting to install wget via pkg..."
+  log "No wget/curl found. Attempting to install wget..."
   pkg update -y >/dev/null 2>&1 || true
   pkg install -y wget >/dev/null 2>&1 || true
-  if command -v wget >/dev/null 2>&1; then
-    DL_TOOL="wget"
-  elif command -v curl >/dev/null 2>&1; then
-    DL_TOOL="curl"
-  else
-    log "Failed to obtain wget/curl. Install one and re-run."
-    exit 1
-  fi
+  DL_TOOL="$(command -v wget >/dev/null 2>&1 && echo wget || command -v curl >/dev/null 2>&1 && echo curl)"
+  [ -z "$DL_TOOL" ] && log "Failed to install downloader." && exit 1
 fi
 log "Using downloader: $DL_TOOL"
 
+# ----------------- Root Detection -----------------
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu --"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+elif command -v magisk >/dev/null 2>&1; then
+  ROOT_CMD="magisk su -c"
+else
+  log "No root helper (tsu, su, magisk) found. Script requires root."
+  exit 1
+fi
+log "Using root command: ${ROOT_CMD%% *}"
+
+# ----------------- Functions -----------------
 download_file() {
   local url="$1"
   local out="$2"
   if [ "$DL_TOOL" = "wget" ]; then
     wget -c -O "$out" "$url"
-    return $?
   else
     curl -L -C - -o "$out" "$url"
-    return $?
   fi
 }
-
-# ----------------- Root + installer setup -----------------
-# Prefer tsu -c; fallback to su -c. Validate root actually works.
-ROOT_SHELL=""
-if command -v tsu >/dev/null 2>&1; then
-  ROOT_SHELL="tsu -c"
-elif command -v su >/dev/null 2>&1; then
-  ROOT_SHELL="su -c"
-else
-  log "No root helper (tsu or su) found. This script requires root for silent installs."
-  log "Install tsu (pkg install tsu) or ensure su is available, then re-run."
-  exit 1
-fi
-log "Using root command: ${ROOT_SHELL%% *}"
-
-# Quick root sanity check (avoids interactive 'root:/ #' drop)
-if ! $ROOT_SHELL 'id -u' >/dev/null 2>&1; then
-  log "Root command exists but is not granted/working. Enable root in VMOS Cloud and allow superuser access, then retry."
-  exit 1
-fi
-
-# Determine best package manager CLI on Android 13+
-PM_BIN="pm"
-if command -v cmd >/dev/null 2>&1; then
-  PM_CMD="cmd package"
-else
-  PM_CMD="pm"
-fi
 
 install_apk_root() {
   local apk_path="$1"
-
-  # Prefer Android 13 style via 'cmd package' and explicit user 0, with runtime grants
-  local cmd1="$PM_CMD install -r -g --user 0 -i com.android.shell '$apk_path'"
-  # Fallback to legacy pm
-  local cmd2="pm install -r -g '$apk_path'"
-
-  # Try primary
-  if $ROOT_SHELL "$cmd1"; then
-    return 0
+  if command -v tsu >/dev/null 2>&1; then
+    tsu pm install -r -g "$apk_path"
+  elif command -v magisk >/dev/null 2>&1; then
+    magisk su -c "pm install -r -g '$apk_path'"
+  else
+    su -c "pm install -r -g '$apk_path'"
   fi
-  # Fallback
-  $ROOT_SHELL "$cmd2"
-  return $?
+
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    log "Silent install failed. Try manual install: adb install \"$apk_path\""
+  fi
+  return $rc
 }
 
-# ----------------- Trigger fetch -----------------
 get_remote_flag() {
   local content=""
   if [ "$DL_TOOL" = "wget" ]; then
@@ -193,89 +173,29 @@ get_remote_flag() {
   esac
 }
 
-# ----------------- One run (download + install all) -----------------
 do_downloads_and_installs() {
   log "Starting downloads and installs into $WORKDIR"
-  log "----"
   for url in "${LINKS[@]}"; do
     fname="${url##*/}"
     log "Processing: $fname"
+    [ -f "$fname" ] && [ ! -s "$fname" ] && rm -f "$fname"
 
-    if [ -f "$fname" ] && [ ! -s "$fname" ]; then
-      log "Removing zero-size stale file $fname"
-      rm -f "$fname"
-    fi
-
-    log "Downloading from: $url"
+    log "Downloading: $url"
     download_file "$url" "$fname"
-    dlrc=$?
-    if [ $dlrc -ne 0 ]; then
-      log "Error: download failed for $fname (code $dlrc). Skipping."
-      continue
-    fi
-
-    if [ ! -s "$fname" ]; then
-      log "Downloaded file is empty. Skipping install for $fname."
-      continue
-    fi
+    [ $? -ne 0 ] && log "Download failed for $fname" && continue
+    [ ! -s "$fname" ] && log "Empty file. Skipping $fname." && continue
 
     size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
     log "Downloaded $fname (${size_bytes} bytes). Installing..."
     install_apk_root "$PWD/$fname"
-    inst_rc=$?
-    if [ $inst_rc -eq 0 ]; then
+    if [ $? -eq 0 ]; then
       log "Installed $fname successfully."
-      if [ "$KEEP_APKS" = "0" ]; then
-        log "Removing $fname to save space..."
-        rm -f "$fname"
-      else
-        log "Keeping $fname as requested (KEEP_APKS=1)."
-      fi
+      [ "$KEEP_APKS" = "0" ] && rm -f "$fname" || log "Keeping $fname (KEEP_APKS=1)"
     else
-      log "Warning: installation failed for $fname (pm/cmd exit $inst_rc). File kept for debugging."
+      log "Install failed for $fname. File kept for debugging."
     fi
   done
-  log "All tasks finished. Workdir: $WORKDIR"
+  log "All tasks finished."
 }
 
-# ----------------- TEST mode (one APK) -----------------
-if [ "$TEST_MODE" = 1 ]; then
-  log "TEST MODE: only downloading + installing the first APK once."
-  if [ ${#LINKS[@]} -gt 0 ]; then
-    first="${LINKS[0]}"
-    LINKS=("$first")
-  fi
-  do_downloads_and_installs
-  exit 0
-fi
-
-# ----------------- Daemon loop -----------------
-last_state=""
-if [ -f "$STATE_FILE" ]; then
-  last_state="$(cat "$STATE_FILE" 2>/dev/null || true)"
-fi
-last_state="${last_state:-}"
-
-log "Daemon starting. Polling $TRIGGER_URL every ${POLL_INTERVAL}s. Initial last_state='$last_state'. Logfile: ${LOGFILE}"
-
-while true; do
-  remote="$(get_remote_flag)"
-  if [ -z "$remote" ]; then
-    log "Warning: could not fetch remote trigger (network issue or unexpected content). Will retry in ${POLL_INTERVAL}s."
-    sleep "$POLL_INTERVAL"
-    continue
-  fi
-
-  if [ "$remote" != "$last_state" ]; then
-    log "Remote state changed: '$last_state' -> '$remote'"
-    if [ "$remote" = "1" ]; then
-      do_downloads_and_installs
-    else
-      log "Remote is '0' — idle."
-    fi
-    printf '%s' "$remote" > "$STATE_FILE"
-    last_state="$remote"
-  fi
-
-  sleep "$POLL_INTERVAL"
-done
+# -----------------
