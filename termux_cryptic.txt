@@ -1,0 +1,154 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Full Termux Daemon Script — self-booting, function-loaded, external script capable
+
+# --- Detect if we're being sourced ---
+__CRYPTIC_SELF="${BASH_SOURCE[0]}"
+__CRYPTIC_IS_MAIN=0
+if [[ "${__CRYPTIC_SELF}" == "$0" ]]; then
+  __CRYPTIC_IS_MAIN=1
+  set -u
+fi
+
+# --- Configurable Variables ---
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}"
+SCRIPT_TRIGGER_URL="${SCRIPT_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}"
+
+JSON_SOURCE_URL="${JSON_SOURCE_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+JSON_DEST="${JSON_DEST:-/storage/emulated/0/cryptic/Workspace/SpeedHubX/Grow a Garden.json}"
+
+STATE_FILE="${WORKDIR}/.last_refresh_state"
+STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script"
+
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# --- Runtime Flags ---
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+RUN_SCRIPTS=()
+EXEC_SCRIPTS=()
+
+# --- Helpers ---
+log() {
+  printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+init_environment() {
+  mkdir -p "$WORKDIR" && cd "$WORKDIR" || exit 1
+  if command -v wget >/dev/null; then DL_TOOL="wget"
+  elif command -v curl >/dev/null; then DL_TOOL="curl"
+  else pkg install wget -y && DL_TOOL="wget"
+  fi
+
+  ROOT_CMD=""
+  if command -v tsu >/dev/null; then ROOT_CMD="tsu"
+  elif command -v su >/dev/null; then ROOT_CMD="su -c"
+  else log "Root not available"; exit 1
+  fi
+}
+
+download_file() {
+  [ "$DL_TOOL" = "wget" ] && wget -q -O "$2" "$1" || curl -fsSL -o "$2" "$1"
+}
+
+install_apk_root() {
+  "$ROOT_CMD" pm install -r -g "$1"
+}
+
+get_remote_flag() {
+  content="$($DL_TOOL -qO- "$1" 2>/dev/null | tr -d '[:space:]' | head -c1)"
+  [[ "$content" =~ [01] ]] && echo "$content"
+}
+
+run_as_root() {
+  "$ROOT_CMD" "$*"
+}
+
+update_json_from_remote() {
+  tmp="$WORKDIR/tmp.json"
+  download_file "$JSON_SOURCE_URL" "$tmp" && run_as_root "cp '$tmp' '$JSON_DEST'"
+}
+
+do_downloads_and_installs() {
+  for url in "${LINKS[@]}"; do
+    file="${WORKDIR}/${url##*/}"
+    download_file "$url" "$file" && install_apk_root "$file"
+    [ "$KEEP_APKS" = "0" ] && rm -f "$file"
+  done
+}
+
+run_script_source() {
+  local script="$1"; shift
+  ( . "$__CRYPTIC_SELF"; "$script" "$@" )
+}
+
+run_script_exec() {
+  export -f log download_file install_apk_root run_as_root get_remote_flag update_json_from_remote do_downloads_and_installs
+  bash -c "source '$__CRYPTIC_SELF'; '$1' \"$@\""
+}
+
+setup_termux_boot() {
+  local boot_dir="$HOME/.termux/boot"
+  local boot_script="$boot_dir/start_cryptics.sh"
+  mkdir -p "$boot_dir"
+  echo "#!/data/data/com.termux/files/usr/bin/bash" > "$boot_script"
+  echo "exec \"$__CRYPTIC_SELF\" --daemonize" >> "$boot_script"
+  chmod +x "$boot_script"
+  log "✔️ Installed Termux boot hook at: $boot_script"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --daemonize) DAEMONIZE=1 ;;
+      --pidfile) PIDFILE="$2"; shift ;;
+      --logfile) LOGFILE="$2"; shift ;;
+      --test) TEST_MODE=1 ;;
+      --run) RUN_SCRIPTS+=("$2"); shift ;;
+      --exec) EXEC_SCRIPTS+=("$2"); shift ;;
+    esac
+    shift
+  done
+  PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+  LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+}
+
+main() {
+  parse_args "$@"
+  init_environment
+
+  # Auto-install Termux Boot hook
+  setup_termux_boot
+
+  [ "$DAEMONIZE" = 1 ] && nohup "$0" "$@" > "$LOGFILE" 2>&1 & echo $! > "$PIDFILE" && exit 0
+
+  while true; do
+    remote_flag="$(get_remote_flag "$TRIGGER_URL")"
+    if [ "$remote_flag" = "1" ]; then do_downloads_and_installs; fi
+
+    script_flag="$(get_remote_flag "$SCRIPT_TRIGGER_URL")"
+    if [ "$script_flag" = "1" ]; then update_json_from_remote; fi
+
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+# --- Entry Point ---
+[ "$__CRYPTIC_IS_MAIN" -eq 1 ] && main "$@"
