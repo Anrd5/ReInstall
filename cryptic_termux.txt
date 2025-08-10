@@ -1,16 +1,40 @@
 #!/usr/bin/env bash
 # install_cryptics_daemon.sh
-# Single-file: one-shot installer + continuous daemon that polls a remote trigger file.
-# Includes: original 8 APK links, resume downloads, silent root installs (tsu/su),
-#          KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
+# One-shot installer + continuous daemon with dual triggers:
+#  - APK refresh (RefreshClones.txt)
+#  - JSON config update (RefreshScript.txt)
+#
+# Changes:
+# - Defaults to background (daemon). Use --foreground to stay attached.
+# - Accepts GitHub "blob" links and fetches raw content automatically.
+# - Adds SpeedHubX JSON updater when the second trigger flips to '1'.
+#
+# Includes: resume downloads, silent root installs (tsu/su),
+# KEEP_APKS support, --test, --foreground/--daemonize, --pidfile, --logfile, --help.
 set -u
 
 # ----------------- Configuration (can be overridden with env vars) -----------------
 WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
-KEEP_APKS="${KEEP_APKS:-0}"   # set KEEP_APKS=1 to keep apk files
-POLL_INTERVAL="${POLL_INTERVAL:-30}"   # seconds between trigger checks
-TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
-STATE_FILE="${WORKDIR}/.last_refresh_state"
+KEEP_APKS="${KEEP_APKS:-0}"                 # set KEEP_APKS=1 to keep apk files
+POLL_INTERVAL="${POLL_INTERVAL:-30}"        # seconds between trigger checks
+
+# Your trigger links (blob is okay; we convert to raw automatically)
+TRIGGER_URL_CLONES="${TRIGGER_URL_CLONES:-https://github.com/Anrd5/MyAppCollection/blob/main/RefreshClones.txt}"
+TRIGGER_URL_SCRIPT="${TRIGGER_URL_SCRIPT:-https://github.com/Anrd5/MyAppCollection/blob/main/RefreshScript.txt}"
+
+# Config JSON to copy into the local file when SCRIPT trigger flips
+CONFIG_URL="${CONFIG_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+
+# Target JSON path on device storage (ensure termux-setup-storage has been run)
+STORAGE_BASE="${STORAGE_BASE:-/storage/emulated/0}"
+JSON_DIR="${JSON_DIR:-$STORAGE_BASE/Cryptic/Workspace/SpeedHubX}"
+JSON_FILE_BASENAME="${JSON_FILE_BASENAME:-Grow a Garden.json}"
+JSON_TARGET="${JSON_DIR}/${JSON_FILE_BASENAME}"
+
+# State files (kept in WORKDIR)
+STATE_FILE_CLONES="${WORKDIR}/.last_refresh_clones"
+STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script"
+
 PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
 LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
 
@@ -27,7 +51,8 @@ LINKS=(
 )
 
 # ----------------- CLI parsing -----------------
-DAEMONIZE=0
+# Default: run as daemon so other Termux scripts can run freely
+DAEMONIZE=1
 TEST_MODE=0
 PIDFILE=""
 LOGFILE=""
@@ -37,19 +62,23 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --daemonize           Run as background daemon (uses nohup, writes PID & log)
+  --foreground          Run in foreground (default is to daemonize)
+  --daemonize           Force background daemon (default)
   --pidfile <path>      Specify PID file (default: ${PIDFILE_DEFAULT})
   --logfile <path>      Specify logfile (default: ${LOGFILE_DEFAULT})
   --test                Test mode: download & install only the first APK once, then exit
   --help                Show this help and exit
 
 Environment variables:
-  WORKDIR, KEEP_APKS, POLL_INTERVAL, TRIGGER_URL
+  WORKDIR, KEEP_APKS, POLL_INTERVAL,
+  TRIGGER_URL_CLONES, TRIGGER_URL_SCRIPT,
+  CONFIG_URL, STORAGE_BASE, JSON_DIR, JSON_FILE_BASENAME
 
 Examples:
-  $0 --test
-  $0 --daemonize
-  POLL_INTERVAL=10 KEEP_APKS=1 $0 --daemonize --logfile /sdcard/cryptic_log.txt
+  $0                         # starts in background (daemon)
+  $0 --foreground            # run attached
+  $0 --daemonize --logfile /sdcard/cryptic_log.txt
+  POLL_INTERVAL=10 KEEP_APKS=1 $0
 EOF
 }
 
@@ -58,6 +87,7 @@ i=1
 while [ $i -le $# ]; do
   arg="${!i}"
   case "$arg" in
+    --foreground) DAEMONIZE=0 ;;
     --daemonize) DAEMONIZE=1 ;;
     --pidfile) i=$((i+1)); PIDFILE="${!i:-}";;
     --logfile) i=$((i+1)); LOGFILE="${!i:-}";;
@@ -77,8 +107,27 @@ cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
 
 log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
 
-# Daemonize: parent launches child with nohup and exits (child gets --child)
-if [ "$DAEMONIZE" = 1 ]; then
+to_raw_url() {
+  # Converts GitHub "blob" URLs to raw.githubusercontent.com.
+  # Leaves non-GitHub URLs or release download links untouched.
+  # Examples:
+  # https://github.com/user/repo/blob/branch/path -> https://raw.githubusercontent.com/user/repo/branch/path
+  local u="$1"
+  case "$u" in
+    https://github.com/*/blob/*)
+      # Strip prefix and rebuild
+      local rest="${u#https://github.com/}"             # user/repo/blob/branch/path
+      local user="${rest%%/*}"; rest="${rest#*/}"       # repo/blob/branch/path
+      local repo="${rest%%/*}"; rest="${rest#*/}"       # blob/branch/path
+      rest="${rest#blob/}"                               # branch/path
+      printf 'https://raw.githubusercontent.com/%s/%s/%s' "$user" "$repo" "$rest"
+      ;;
+    *) printf '%s' "$u" ;;
+  esac
+}
+
+# Daemonize: parent launches child and exits
+if [ "$DAEMONIZE" = 1 ] && [ "$TEST_MODE" = 0 ]; then
   # If already running, exit
   if [ -f "$PIDFILE" ]; then
     oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
@@ -89,8 +138,8 @@ if [ "$DAEMONIZE" = 1 ]; then
       rm -f "$PIDFILE" 2>/dev/null || true
     fi
   fi
-  # Re-launch self with nohup into log
   mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+  # Relaunch self in background; preserve key flags
   nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
   childpid=$!
   echo "$childpid" > "$PIDFILE"
@@ -136,24 +185,31 @@ else
 fi
 log "Using root command: ${ROOT_CMD%% *}"
 
-# ----------------- Core functions (kept from your original) -----------------
+# ----------------- Core functions -----------------
 download_file() {
   local url="$1"
   local out="$2"
   if [ "$DL_TOOL" = "wget" ]; then
-    # -c resume, -O to write filename exactly
     wget -c -O "$out" "$url"
     return $?
   else
-    # curl fallback: -L follow redirects, -C - resume, -o output
     curl -L -C - -o "$out" "$url"
     return $?
   fi
 }
 
+fetch_text() {
+  # Echoes remote file contents to stdout; returns non-zero on failure
+  local url="$1"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -qO- "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
 install_apk_root() {
   local apk_path="$1"
-  # pm install flags: -r = reinstall, -g = grant all runtime permissions
   if command -v tsu >/dev/null 2>&1; then
     tsu pm install -r -g "$apk_path"
     return $?
@@ -163,14 +219,12 @@ install_apk_root() {
   fi
 }
 
-# ----------------- Trigger fetch -----------------
+# ----------------- Triggers -----------------
 get_remote_flag() {
+  local any_url="$1"
+  local url="$(to_raw_url "$any_url")"
   local content=""
-  if [ "$DL_TOOL" = "wget" ]; then
-    content="$(wget -qO- "$TRIGGER_URL" 2>/dev/null || true)"
-  else
-    content="$(curl -fsSL "$TRIGGER_URL" 2>/dev/null || true)"
-  fi
+  content="$(fetch_text "$url" 2>/dev/null || true)"
   content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
   case "$content" in
     0|1) printf '%s' "$content" ;;
@@ -178,7 +232,7 @@ get_remote_flag() {
   esac
 }
 
-# ----------------- One run (the original loop) -----------------
+# ----------------- APK flow -----------------
 do_downloads_and_installs() {
   log "Starting downloads and installs into $WORKDIR"
   log "----"
@@ -219,7 +273,44 @@ do_downloads_and_installs() {
       log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging."
     fi
   done
-  log "All tasks finished. Workdir: $WORKDIR"
+  log "APK tasks finished. Workdir: $WORKDIR"
+}
+
+# ----------------- JSON config update flow -----------------
+update_speedhubx_config() {
+  local raw_cfg_url="$(to_raw_url "$CONFIG_URL")"
+  local tmp_out="${WORKDIR}/.SpeedHubX.Config.json.$$"
+  log "Fetching config JSON from: $raw_cfg_url"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -qO "$tmp_out" "$raw_cfg_url" || true
+  else
+    curl -fsSL -o "$tmp_out" "$raw_cfg_url" || true
+  fi
+
+  if [ ! -s "$tmp_out" ]; then
+    log "Error: failed to download config or file is empty. Aborting config update."
+    rm -f "$tmp_out" 2>/dev/null || true
+    return 1
+  fi
+
+  # Ensure target dir exists and is writable
+  if [ ! -d "$JSON_DIR" ]; then
+    mkdir -p "$JSON_DIR" 2>/dev/null || true
+  fi
+  if [ ! -d "$JSON_DIR" ] || [ ! -w "$JSON_DIR" ]; then
+    log "Error: cannot write to '$JSON_DIR'. Did you run 'termux-setup-storage'? Aborting."
+    rm -f "$tmp_out" 2>/dev/null || true
+    return 1
+  fi
+
+  # Backup and replace
+  if [ -f "$JSON_TARGET" ]; then
+    cp -f "$JSON_TARGET" "${JSON_TARGET}.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  fi
+  mv -f "$tmp_out" "$JSON_TARGET"
+  sync || true
+  log "Updated: $JSON_TARGET"
+  return 0
 }
 
 # ----------------- TEST mode: one-shot first APK -----------------
@@ -233,32 +324,53 @@ if [ "$TEST_MODE" = 1 ]; then
   exit 0
 fi
 
-# ----------------- Daemon loop: watch trigger and run on 0->1 transition -----------------
-last_state=""
-if [ -f "$STATE_FILE" ]; then
-  last_state="$(cat "$STATE_FILE" 2>/dev/null || true)"
-fi
-last_state="${last_state:-}"
+# ----------------- Daemon loop: watch triggers and act on 0->1 transitions -----------------
+last_clones=""
+last_script=""
 
-log "Daemon starting. Polling $TRIGGER_URL every ${POLL_INTERVAL}s. Initial last_state='$last_state'. Logfile: ${LOGFILE}"
+[ -f "$STATE_FILE_CLONES" ] && last_clones="$(cat "$STATE_FILE_CLONES" 2>/dev/null || true)"
+[ -f "$STATE_FILE_SCRIPT" ] && last_script="$(cat "$STATE_FILE_SCRIPT" 2>/dev/null || true)"
+
+log "Daemon starting."
+log "Polling every ${POLL_INTERVAL}s"
+log "Clone trigger:   $(to_raw_url "$TRIGGER_URL_CLONES")  (last='${last_clones:-}')"
+log "Script trigger:  $(to_raw_url "$TRIGGER_URL_SCRIPT")  (last='${last_script:-}')"
+log "JSON target:     $JSON_TARGET"
+log "Logfile:         ${LOGFILE}"
 
 while true; do
-  remote="$(get_remote_flag)"
-  if [ -z "$remote" ]; then
-    log "Warning: could not fetch remote trigger (network issue or unexpected content). Will retry in ${POLL_INTERVAL}s."
-    sleep "$POLL_INTERVAL"
-    continue
+  # RefreshClones trigger
+  remote_c="$(get_remote_flag "$TRIGGER_URL_CLONES")"
+  if [ -n "$remote_c" ]; then
+    if [ "${remote_c:-}" != "${last_clones:-}" ]; then
+      log "Clone trigger changed: '${last_clones:-}' -> '$remote_c'"
+      if [ "$remote_c" = "1" ]; then
+        do_downloads_and_installs
+      else
+        log "Clone trigger is '0' — idle."
+      fi
+      printf '%s' "$remote_c" > "$STATE_FILE_CLONES"
+      last_clones="$remote_c"
+    fi
+  else
+    log "Warning: could not fetch clone trigger (network or unexpected content)."
   fi
 
-  if [ "$remote" != "$last_state" ]; then
-    log "Remote state changed: '$last_state' -> '$remote'"
-    if [ "$remote" = "1" ]; then
-      do_downloads_and_installs
-    else
-      log "Remote is '0' — idle."
+  # RefreshScript trigger
+  remote_s="$(get_remote_flag "$TRIGGER_URL_SCRIPT")"
+  if [ -n "$remote_s" ]; then
+    if [ "${remote_s:-}" != "${last_script:-}" ]; then
+      log "Script trigger changed: '${last_script:-}' -> '$remote_s'"
+      if [ "$remote_s" = "1" ]; then
+        update_speedhubx_config
+      else
+        log "Script trigger is '0' — idle."
+      fi
+      printf '%s' "$remote_s" > "$STATE_FILE_SCRIPT"
+      last_script="$remote_s"
     fi
-    printf '%s' "$remote" > "$STATE_FILE"
-    last_state="$remote"
+  else
+    log "Warning: could not fetch script trigger (network or unexpected content)."
   fi
 
   sleep "$POLL_INTERVAL"
