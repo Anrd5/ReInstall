@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# install_cryptics_daemon.sh
+# One-shot installer + continuous daemon that polls remote trigger files.
+# Adds: JSON config updater driven by a second trigger.
+# Includes: original 8 APK links, resume downloads, silent root installs (tsu/su),
+# KEEP_APKS support, --test, --daemonize, --pidfile, --logfile, --help.
+
+set -u
+
+# ----------------- Pre-install sequence (added) -----------------
+echo "[PRE] Updating Termux and installing prerequisites (step 1)..."
+pkg update -y && pkg upgrade -y && pkg install -y imagemagick python termux-api && pip install --no-input --upgrade pip || true
+pip install --no-input wand
+
+echo "[PRE] Setting up storage and installing dependencies (step 2)..."
+pkg update -y && echo "y" | termux-setup-storage
+pkg install -y python tsu libexpat git openssl lua53
+pip install --no-input aiofiles aiohttp aiosqlite crypto cython pycryptodome pyfiglet requests rich
+
+echo "[PRE] Fetching and running reconnect tool (step 3)..."
+mkdir -p /sdcard/download || true
+curl -fL -o /sdcard/download/reconnect.lua "http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT3x79MrtjKuVwX321098d1fgg"
+
+# Try to launch with whatever Lua is available
+LUA_BIN="$(command -v lua || command -v lua5.3 || command -v lua53 || true)"
+if [ -n "${LUA_BIN:-}" ]; then
+  "$LUA_BIN" /sdcard/download/reconnect.lua || true
+else
+  echo "[PRE] Warning: No 'lua' binary found. Skipping execution of reconnect.lua."
+fi
+
+echo "[PRE] You have 120 seconds to complete reconnect tool setup..."
+sleep 120
+echo "[PRE] Pre-install sequence completed. Proceeding to main script..."
+
+# ----------------- Configuration (override with env vars) -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}" # set KEEP_APKS=1 to keep apk files
+POLL_INTERVAL="${POLL_INTERVAL:-30}" # seconds between trigger checks
+
+# Triggers (0/1 content; '1' triggers actions on change)
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}" # APK trigger (updated)
+SCRIPT_TRIGGER_URL="${SCRIPT_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}" # JSON trigger (new)
+
+# JSON updater
+JSON_SOURCE_URL="${JSON_SOURCE_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+JSON_DEST="${JSON_DEST:-/storage/emulated/0/cryptic/Workspace/SpeedHubX/Grow a Garden.json}"
+
+# State tracking
+STATE_FILE="${WORKDIR}/.last_refresh_state"      # legacy: APK trigger
+STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script" # new: JSON trigger
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
+# ----------------- The APK links (unchanged) -----------------
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# ----------------- CLI parsing -----------------
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize           Run as background daemon (uses nohup, writes PID & log)
+  --pidfile <path>      Specify PID file (default: ${PIDFILE_DEFAULT})
+  --logfile <path>      Specify logfile (default: ${LOGFILE_DEFAULT})
+  --test                Test mode: download & install only the first APK once, then exit
+  --help                Show this help and exit
+
+Environment variables:
+  WORKDIR, KEEP_APKS, POLL_INTERVAL
+  TRIGGER_URL           APK trigger URL (default: main-branch RefreshClones.txt)
+  SCRIPT_TRIGGER_URL    JSON trigger URL (default: main-branch RefreshScript.txt)
+  JSON_SOURCE_URL       Remote JSON to fetch (default: SpeedHubX.Config.json release)
+  JSON_DEST             Destination JSON path (default: /storage/emulated/0/cryptic/Workspace/SpeedHubX/Grow a Garden.json)
+
+Examples:
+  $0 --test
+  $0 --daemonize POLL_INTERVAL=10 KEEP_APKS=1
+  $0 --daemonize --logfile /sdcard/cryptic_log.txt
+EOF
+}
+
+# Simple args loop
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    --daemonize) DAEMONIZE=1 ;;
+    --pidfile)   i=$((i+1)); PIDFILE="${!i:-}";;
+    --logfile)   i=$((i+1)); LOGFILE="${!i:-}";;
+    --test)      TEST_MODE=1 ;;
+    --help|-h)   usage; exit 0 ;;
+    *)           echo "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+  i=$((i+1))
+done
+
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+# ----------------- Helpers -----------------
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
+
+log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
+
+# Daemonize: parent launches child with nohup and exits
+if [ "$DAEMONIZE" = 1 ]; then
+  # If already running, exit
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "Daemon already running (PID $oldpid). Exiting."
+      exit 0
+    else
+      rm -f "$PIDFILE" 2>/dev/null || true
+    fi
+  fi
+
+  # Re-launch self with nohup into log
+  mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid). Log: $LOGFILE PID: $PIDFILE"
+  exit 0
+fi
+
+# If running (foreground/child) write PID file
+printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
+trap 'if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
+
+# ----------------- Downloader selection -----------------
+DL_TOOL=""
+if command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+elif command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+else
+  log "No wget/curl found. Attempting to install wget via pkg..."
+  pkg update -y >/dev/null 2>&1 || true
+  pkg install -y wget >/dev/null 2>&1 || true
+  if command -v wget >/dev/null 2>&1; then
+    DL_TOOL="wget"
+  elif command -v curl >/dev/null 2>&1; then
+    DL_TOOL="curl"
+  else
+    log "Failed to obtain wget/curl. Install one and re-run."
+    exit 1
+  fi
+fi
+log "Using downloader: $DL_TOOL"
+
+# ----------------- Root helper -----------------
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu --"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  log "No root helper (tsu or su) found. Script requires root to install silently."
+  log "Install tsu (pkg install tsu) or ensure su is available, then re-run."
+  exit 1
+fi
+log "Using root command: ${ROOT_CMD%% *}"
+
+run_as_root() {
+  # Usage: run_as_root "<shell command string>"
+  local cmd="$*"
+  if command -v tsu >/dev/null 2>&1; then
+    tsu -- sh -c "$cmd"
+  else
+    su -c "$cmd"
+  fi
+}
+
+# ----------------- Core functions -----------------
+download_file() {
+  local url="$1"
+  local out="$2"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -c -O "$out" "$url"
+    return $?
+  else
+    curl -L -C - -o "$out" "$url"
+    return $?
+  fi
+}
+
+install_apk_root() {
+  local apk_path="$1"
+  # pm install flags: -r = reinstall, -g = grant all runtime permissions
+  if command -v tsu >/dev/null 2>&1; then
+    tsu pm install -r -g "$apk_path"
+    return $?
+  else
+    su -c "pm install -r -g '$apk_path'"
+    return $?
+  fi
+}
+
+# Fetch trigger (expects '0' or '1'); returns empty on error/unexpected
+get_remote_flag() {
+  local url="$1"
+  local content=""
+  if [ "$DL_TOOL" = "wget" ]; then
+    content="$(wget -qO- "$url" 2>/dev/null || true)"
+  else
+    content="$(curl -fsSL "$url" 2>/dev/null || true)"
+  fi
+  content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
+  case "$content" in
+    0|1) printf '%s' "$content" ;;
+    *)   printf '' ;;
+  esac
+}
+
+do_downloads_and_installs() {
+  log "Starting APK downloads and installs into $WORKDIR"
+  log "----"
+  for url in "${LINKS[@]}"; do
+    fname="${url##*/}"
+    log "Processing: $fname"
+
+    if [ -f "$fname" ] && [ ! -s "$fname" ]; then
+      log "Removing zero-size stale file $fname"
+      rm -f "$fname"
+    fi
+
+    log "Downloading from: $url"
+    download_file "$url" "$fname"
+    dlrc=$?
+    if [ $dlrc -ne 0 ]; then
+      log "Error: download failed for $fname (code $dlrc). Skipping."
+      continue
+    fi
+
+    if [ ! -s "$fname" ]; then
+      log "Downloaded file is empty. Skipping install for $fname."
+      continue
+    fi
+
+    size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
+    log "Downloaded $fname (${size_bytes} bytes). Installing..."
+
+    install_apk_root "$PWD/$fname"
+    inst_rc=$?
+    if [ $inst_rc -eq 0 ]; then
+      log "Installed $fname successfully."
+      if [ "$KEEP_APKS" = "0" ]; then
+        log "Removing $fname to save space..."
+        rm -f "$fname"
+      else
+        log "Keeping $fname as requested (KEEP_APKS=1)."
+      fi
+    else
+      log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept for debugging."
+    fi
+  done
+  log "APK tasks finished. Workdir: $WORKDIR"
+}
+
+update_json_from_remote() {
+  log "Starting JSON update: source=$JSON_SOURCE_URL -> dest=$JSON_DEST"
+  local tmp="${WORKDIR}/SpeedHubX.Config.json.tmp"
+
+  download_file "$JSON_SOURCE_URL" "$tmp"
+  dlrc=$?
+  if [ $dlrc -ne 0 ]; then
+    log "Error: JSON download failed (code $dlrc). Aborting JSON update."
+    return 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    log "Downloaded JSON is empty. Aborting JSON update."
+    return 1
+  fi
+
+  size_bytes=$(stat -c%s "$tmp" 2>/dev/null || ls -l "$tmp" | awk '{print $5}')
+  log "Downloaded JSON (${size_bytes} bytes). Writing to destination..."
+
+  local dest_dir
+  dest_dir="$(dirname "$JSON_DEST")"
+  run_as_root "mkdir -p '$dest_dir' && cp -f '$tmp' '$JSON_DEST'"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    log "JSON update completed successfully at: $JSON_DEST"
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  else
+    log "Warning: failed to write JSON to $JSON_DEST (code $rc). Temp file kept: $tmp"
+    return $rc
+  fi
+}
+
+# ----------------- TEST mode: one-shot first APK -----------------
+if [ "$TEST_MODE" = 1 ]; then
+  log "TEST MODE: only downloading + installing the first APK once."
+  if [ ${#LINKS[@]} -gt 0 ]; then
+    first="${LINKS[0]}"
+    LINKS=("$first")
+  fi
+  do_downloads_and_installs
+  exit 0
+fi
+
+# ----------------- Daemon loop: watch triggers and run on change -----------------
+last_state_clones=""
+last_state_script=""
+
+# Load prior states if present
+if [ -f "$STATE_FILE" ]; then
+  last_state_clones="$(cat "$STATE_FILE" 2>/dev/null || true)"
+fi
+if [ -f "$STATE_FILE_SCRIPT" ]; then
+  last_state_script="$(cat "$STATE_FILE_SCRIPT" 2>/dev/null || true)"
+fi
+
+log "Daemon starting. Polling every ${POLL_INTERVAL}s."
+log " - APK trigger: $TRIGGER_URL (last='$last_state_clones')"
+log " - JSON trigger: $SCRIPT_TRIGGER_URL (last='$last_state_script')"
+log "Logfile: ${LOGFILE}"
+
+while true; do
+  # APK trigger (RefreshClones)
+  remote_clones="$(get_remote_flag "$TRIGGER_URL")"
+  if [ -z "$remote_clones" ]; then
+    log "Warning: could not fetch APK trigger (network issue or unexpected content)."
+  elif [ "$remote_clones" != "$last_state_clones" ]; then
+    log "APK trigger changed: '$last_state_clones' -> '$remote_clones'"
+    if [ "$remote_clones" = "1" ]; then
+      do_downloads_and_installs
+    else
+      log "APK trigger is '0' — idle."
+    fi
+    printf '%s' "$remote_clones" > "$STATE_FILE"
+    last_state_clones="$remote_clones"
+  fi
+
+  # JSON trigger (RefreshScript)
+  remote_script="$(get_remote_flag "$SCRIPT_TRIGGER_URL")"
+  if [ -z "$remote_script" ]; then
+    log "Warning: could not fetch JSON trigger (network issue or unexpected content)."
+  elif [ "$remote_script" != "$last_state_script" ]; then
+    log "JSON trigger changed: '$last_state_script' -> '$remote_script'"
+    if [ "$remote_script" = "1" ]; then
+      update_json_from_remote
+    else
+      log "JSON trigger is '0' — idle."
+    fi
+    printf '%s' "$remote_script" > "$STATE_FILE_SCRIPT"
+    last_state_script="$remote_script"
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
