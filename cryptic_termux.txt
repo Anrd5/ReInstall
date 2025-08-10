@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# install_cryptics_daemon.sh
+# One-shot installer + continuous daemon that polls two remote triggers:
+# 1) APK refresh/install
+# 2) JSON config overwrite in shared storage
+#
+# Features: resume downloads, silent root installs (tsu/su), KEEP_APKS, --test,
+# --daemonize, --pidfile, --logfile, --help. Termux-friendly.
+
+set -u
+
+# ----------------- Configuration (env-overridable) -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"                    # 1 = keep APKs after install
+POLL_INTERVAL="${POLL_INTERVAL:-30}"           # seconds
+# Updated APK trigger URL (raw):
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}"
+
+# JSON updater:
+JSON_TRIGGER_URL="${JSON_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}"
+CONFIG_URL="${CONFIG_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+# Default target file (override if your filename differs)
+TARGET_JSON="${TARGET_JSON:-/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json}"
+
+STATE_FILE_APK="${WORKDIR}/.last_refresh_state_apk"
+STATE_FILE_JSON="${WORKDIR}/.last_refresh_state_json"
+
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
+# APK links
+LINKS=(
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# ----------------- CLI parsing -----------------
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize           Run as background daemon (nohup); writes PID & log
+  --pidfile <path>      PID file (default: ${PIDFILE_DEFAULT})
+  --logfile <path>      Log file (default: ${LOGFILE_DEFAULT})
+  --test                Test mode: only download+install first APK once, then exit
+  --help                Show this help and exit
+
+Environment variables:
+  WORKDIR, KEEP_APKS, POLL_INTERVAL, TRIGGER_URL,
+  JSON_TRIGGER_URL, CONFIG_URL, TARGET_JSON
+
+Examples:
+  $0 --test
+  $0 --daemonize
+  POLL_INTERVAL=10 KEEP_APKS=1 TARGET_JSON="/storage/emulated/0/.../Grow A Garden.json" \\
+    $0 --daemonize --logfile /sdcard/cryptic_log.txt
+EOF
+}
+
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    --daemonize) DAEMONIZE=1 ;;
+    --pidfile) i=$((i+1)); PIDFILE="${!i:-}";;
+    --logfile) i=$((i+1)); LOGFILE="${!i:-}";;
+    --test) TEST_MODE=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+  i=$((i+1))
+done
+
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+# ----------------- Setup -----------------
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
+
+log() { printf '[%s] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*"; }
+
+# Optional: keep CPU awake when running in Termux (if available)
+if command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock >/dev/null 2>&1 || true
+fi
+
+# ----------------- Daemonize -----------------
+if [ "$DAEMONIZE" = 1 ]; then
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "Daemon already running (PID $oldpid). Exiting."
+      exit 0
+    else
+      rm -f "$PIDFILE" 2>/dev/null || true
+    fi
+  fi
+  mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+  # Re-launch into background with same environment, writing output to LOGFILE
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
+  exit 0
+fi
+
+printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
+trap '
+  if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi
+  log "Exiting"
+  if command -v termux-wake-unlock >/dev/null 2>&1; then termux-wake-unlock >/dev/null 2>&1 || true; fi
+  exit 0
+' SIGINT SIGTERM EXIT
+
+# ----------------- Downloader -----------------
+DL_TOOL=""
+if command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+elif command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+else
+  log "No wget/curl found. Attempting to install wget via pkg..."
+  pkg update -y >/dev/null 2>&1 || true
+  pkg install -y wget >/dev/null 2>&1 || true
+  if command -v wget >/dev/null 2>&1; then
+    DL_TOOL="wget"
+  elif command -v curl >/dev/null 2>&1; then
+    DL_TOOL="curl"
+  else
+    log "Failed to obtain wget/curl. Install one and re-run."
+    exit 1
+  fi
+fi
+log "Using downloader: $DL_TOOL"
+
+download_file() {
+  local url="$1"; local out="$2"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -q -c -O "$out" "$url"
+  else
+    curl -fsSL -C - -o "$out" "$url"
+  fi
+}
+
+fetch_text() {
+  local url="$1"; local content=""
+  if [ "$DL_TOOL" = "wget" ]; then
+    content="$(wget -qO- "$url" 2>/dev/null || true)"
+  else
+    content="$(curl -fsSL "$url" 2>/dev/null || true)"
+  fi
+  printf '%s' "$content"
+}
+
+get_remote_flag() {
+  local url="$1"
+  local content
+  content="$(fetch_text "$url")"
+  content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
+  case "$content" in
+    0|1) printf '%s' "$content" ;;
+    *) printf '' ;;
+  esac
+}
+
+# ----------------- Root helper for APK install -----------------
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu --"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  ROOT_CMD=""
+fi
+if [ -z "$ROOT_CMD" ]; then
+  log "No root helper (tsu or su) found. APK installs will fail. Install tsu (pkg install tsu) or ensure su is available."
+else
+  log "Using root command: ${ROOT_CMD%% *}"
+fi
+
+install_apk_root() {
+  local apk_path="$1"
+  if command -v tsu >/dev/null 2>&1; then
+    tsu pm install -r -g "$apk_path"
+    return $?
+  else
+    su -c "pm install -r -g '$apk_path'"
+    return $?
+  fi
+}
+
+# ----------------- APK job -----------------
+do_downloads_and_installs() {
+  log "Starting APK downloads and installs into $WORKDIR"
+  log "----"
+  for url in "${LINKS[@]}"; do
+    fname="${url##*/}"
+    log "Processing: $fname"
+
+    if [ -f "$fname" ] && [ ! -s "$fname" ]; then
+      log "Removing zero-size stale file $fname"
+      rm -f "$fname"
+    fi
+
+    log "Downloading from: $url"
+    if ! download_file "$url" "$fname"; then
+      log "Error: download failed for $fname. Skipping."
+      continue
+    fi
+
+    if [ ! -s "$fname" ]; then
+      log "Downloaded file is empty. Skipping install for $fname."
+      continue
+    fi
+
+    size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
+    log "Downloaded $fname (${size_bytes} bytes). Installing..."
+
+    if [ -z "$ROOT_CMD" ]; then
+      log "Warning: no root. Cannot install $fname silently."
+      continue
+    fi
+
+    install_apk_root "$PWD/$fname"
+    inst_rc=$?
+    if [ $inst_rc -eq 0 ]; then
+      log "Installed $fname successfully."
+      if [ "$KEEP_APKS" = "0" ]; then
+        log "Removing $fname to save space..."
+        rm -f "$fname"
+      else
+        log "Keeping $fname as requested (KEEP_APKS=1)."
+      fi
+    else
+      log "Warning: installation failed for $fname (pm install exit $inst_rc). File kept."
+    fi
+  done
+  log "APK task finished. Workdir: $WORKDIR"
+}
+
+# ----------------- JSON updater job -----------------
+ensure_storage_ready() {
+  # Help user if shared storage isn’t initialized in Termux
+  if [ ! -d "/storage/emulated/0" ]; then
+    log "Shared storage not accessible. Run: termux-setup-storage"
+    return 1
+  fi
+  return 0
+}
+
+update_json_from_config() {
+  log "Starting JSON update: $TARGET_JSON"
+  if ! ensure_storage_ready; then
+    log "Storage not ready. Skipping JSON update."
+    return
+  fi
+
+  local dest_dir dest_tmp
+  dest_dir="$(dirname "$TARGET_JSON")"
+  mkdir -p "$dest_dir" 2>/dev/null || true
+
+  dest_tmp="${WORKDIR}/SpeedHubX.Config.json.tmp"
+
+  log "Downloading config: $CONFIG_URL"
+  if ! download_file "$CONFIG_URL" "$dest_tmp"; then
+    log "Error: failed to download config."
+    rm -f "$dest_tmp" 2>/dev/null || true
+    return
+  fi
+
+  if [ ! -s "$dest_tmp" ]; then
+    log "Downloaded config is empty. Aborting update."
+    rm -f "$dest_tmp" 2>/dev/null || true
+    return
+  fi
+
+  # Overwrite atomically
+  if mv -f "$dest_tmp" "$TARGET_JSON"; then
+    log "Updated: $TARGET_JSON"
+  else
+    log "Failed to write to $TARGET_JSON (permissions?). Did you run termux-setup-storage?"
+    rm -f "$dest_tmp" 2>/dev/null || true
+  fi
+}
+
+# ----------------- TEST mode -----------------
+if [ "$TEST_MODE" = 1 ]; then
+  log "TEST MODE: only downloading + installing the first APK once."
+  if [ ${#LINKS[@]} -gt 0 ]; then
+    first="${LINKS[0]}"
+    LINKS=("$first")
+  fi
+  do_downloads_and_installs
+  exit 0
+fi
+
+# ----------------- Daemon loop (two triggers) -----------------
+last_state_apk=""
+last_state_json=""
+[ -f "$STATE_FILE_APK" ] && last_state_apk="$(cat "$STATE_FILE_APK" 2>/dev/null || true)"
+[ -f "$STATE_FILE_JSON" ] && last_state_json="$(cat "$STATE_FILE_JSON" 2>/dev/null || true)"
+
+log "Daemon starting. Poll every ${POLL_INTERVAL}s."
+log "APK trigger:    $TRIGGER_URL (last='$last_state_apk')"
+log "JSON trigger:   $JSON_TRIGGER_URL (last='$last_state_json')"
+log "JSON config:    $CONFIG_URL"
+log "JSON target:    $TARGET_JSON"
+log "Logfile:        ${LOGFILE}"
+
+while true; do
+  # APK trigger
+  remote_apk="$(get_remote_flag "$TRIGGER_URL")"
+  if [ -z "$remote_apk" ]; then
+    log "APK: could not fetch trigger (network or content issue)."
+  else
+    if [ "$remote_apk" != "$last_state_apk" ]; then
+      log "APK: state changed '$last_state_apk' -> '$remote_apk'"
+      if [ "$remote_apk" = "1" ]; then
+        do_downloads_and_installs
+      else
+        log "APK: remote is '0' — idle."
+      fi
+      printf '%s' "$remote_apk" > "$STATE_FILE_APK"
+      last_state_apk="$remote_apk"
+    fi
+  fi
+
+  # JSON trigger
+  remote_json="$(get_remote_flag "$JSON_TRIGGER_URL")"
+  if [ -z "$remote_json" ]; then
+    log "JSON: could not fetch trigger (network or content issue)."
+  else
+    if [ "$remote_json" != "$last_state_json" ]; then
+      log "JSON: state changed '$last_state_json' -> '$remote_json'"
+      if [ "$remote_json" = "1" ]; then
+        update_json_from_config
+      else
+        log "JSON: remote is '0' — idle."
+      fi
+      printf '%s' "$remote_json" > "$STATE_FILE_JSON"
+      last_state_json="$remote_json"
+    fi
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
