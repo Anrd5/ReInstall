@@ -1,0 +1,526 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# cryptic_termux.sh
+# Monitors a remote trigger and installs APKs on demand (Termux, Android).
+# Features: config file, robust parsing, downloader/root detection, logging with rotation,
+# daemonization, one-shot install, health/status/stop commands.
+
+set -Eeuo pipefail
+
+# ——————————————————————————————————————————————————————————————————————
+# Defaults (overridden by config file, env, then CLI)
+# ——————————————————————————————————————————————————————————————————————
+CONFIG_FILE_DEFAULT="${HOME}/.config/cryptic_termux/cryptic_termux.conf"
+
+DAEMONIZE="${DAEMONIZE:-0}"
+PIDFILE="${PIDFILE:-${HOME}/.cache/cryptic_termux/cryptic_termux.pid}"
+LOGFILE="${LOGFILE:-${HOME}/.cache/cryptic_termux/cryptic_termux.log}"
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-1048576}"
+STATE_DIR="${STATE_DIR:-${HOME}/.cache/cryptic_termux}"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/Downloads/apks}"
+POLL_INTERVAL="${POLL_INTERVAL:-60}"
+TRIGGER_URL="${TRIGGER_URL:-${CRYPTIC_TRIGGER_URL:-}}"
+TEST_MODE="${TEST_MODE:-0}"
+
+# Key lists for flexible JSON triggers (comma-separated keys, first match wins)
+JSON_INSTALL_KEYS="${JSON_INSTALL_KEYS:-install,enabled,INSTALL,ENABLED}"
+JSON_URL_KEYS="${JSON_URL_KEYS:-apk_url,APK_URL}"
+JSON_SHA256_KEYS="${JSON_SHA256_KEYS:-sha256,SHA256}"
+JSON_NONCE_KEYS="${JSON_NONCE_KEYS:-nonce,NONCE,version,VERSION}"
+
+# Command switches (internal)
+CMD_STOP=0
+CMD_STATUS=0
+CMD_HEALTH=0
+CMD_ONCE=0
+CMD_INSTALL_URL=""
+CMD_INSTALL_SHA256=""
+CMD_INSTALL_NAME=""
+
+# ——————————————————————————————————————————————————————————————————————
+# Utilities
+# ——————————————————————————————————————————————————————————————————————
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+
+Primary modes:
+  --daemonize                 Run in background and write PID file
+  --once                      Run a single poll/install cycle and exit
+  --stop                      Stop a running daemon (uses --pidfile)
+  --status                    Show daemon status
+  --health                    Print effective configuration and environment
+
+Trigger & polling:
+  --trigger=URL               Remote trigger URL (JSON or KEY=VALUE)
+  --interval=SECONDS          Poll interval (default: ${POLL_INTERVAL})
+
+Install (one-shot direct URL):
+  --install-url=URL           Download and install this APK immediately (bypass trigger)
+  --sha256=HEX                Optional checksum for --install-url
+  --name=FILENAME             Optional local filename for --install-url
+
+Paths:
+  --install-dir=DIR           Where APKs are stored (default: ${INSTALL_DIR})
+  --state-dir=DIR             State directory (default: ${STATE_DIR})
+  --logfile=FILE              Log file (default: ${LOGFILE})
+  --pidfile=FILE              PID file (default: ${PIDFILE})
+  --config=FILE               Config file (default: ${CONFIG_FILE_DEFAULT})
+
+Flags:
+  --test                      Dry-run (no install)
+  -h, --help                  Show this help
+
+Environment overrides:
+  TRIGGER_URL or CRYPTIC_TRIGGER_URL, POLL_INTERVAL, INSTALL_DIR, LOGFILE, PIDFILE,
+  STATE_DIR, DAEMONIZE, TEST_MODE, LOG_MAX_SIZE,
+  JSON_INSTALL_KEYS, JSON_URL_KEYS, JSON_SHA256_KEYS, JSON_NONCE_KEYS
+
+Examples:
+  $0 --config="\$HOME/.config/cryptic_termux/cryptic_termux.conf" --daemonize
+  $0 --trigger="https://example.com/trigger.json" --interval=120 --once
+  $0 --install-url="https://example.com/app.apk" --sha256="abc123..." --name="myapp.apk"
+EOF
+}
+
+# Safe parse of KEY=VALUE config (no eval/source)
+load_config_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Trim leading/trailing spaces
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    # Skip comments/blank
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    # Only KEY=VALUE lines
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      # Remove optional surrounding quotes
+      val="${val%\"}"; val="${val#\"}"
+      val="${val%\'}"; val="${val#\'}"
+      case "$key" in
+        TRIGGER_URL|CRYPTIC_TRIGGER_URL|POLL_INTERVAL|INSTALL_DIR|LOGFILE|PIDFILE|STATE_DIR|DAEMONIZE|TEST_MODE|LOG_MAX_SIZE|JSON_INSTALL_KEYS|JSON_URL_KEYS|JSON_SHA256_KEYS|JSON_NONCE_KEYS)
+          printf -v "$key" "%s" "$val"
+          ;;
+        *) ;; # ignore unknown keys
+      esac
+    fi
+  done < "$file"
+}
+
+# Logging with size-based rotation
+rotate_log_if_needed() {
+  local file="$LOGFILE" max="$LOG_MAX_SIZE"
+  [[ -n "$max" && "$max" -gt 0 && -f "$file" ]] || return 0
+  local size
+  size="$(wc -c <"$file" 2>/dev/null || echo 0)"
+  if [[ "$size" -ge "$max" ]]; then
+    mv "$file" "${file}.1" 2>/dev/null || true
+    : > "$file" || true
+  fi
+}
+
+log() {
+  rotate_log_if_needed
+  local msg="[$(date +%Y-%m-%dT%H:%M:%S%z)] $*"
+  echo "$msg" | tee -a "$LOGFILE" >/dev/null
+}
+
+die() { log "ERROR: $*"; exit 1; }
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR" "$(dirname "$LOGFILE")" "$INSTALL_DIR"
+  touch "$LOGFILE" || true
+}
+
+# ——————————————————————————————————————————————————————————————————————
+# Argument parsing
+# ——————————————————————————————————————————————————————————————————————
+CONFIG_FILE="$CONFIG_FILE_DEFAULT"
+for arg in "$@"; do
+  case "$arg" in
+    --config=*) CONFIG_FILE="${arg#*=}" ;;
+  esac
+done
+
+# Load config early (lowest precedence after built-ins)
+load_config_file "$CONFIG_FILE"
+
+# Parse remaining
+for arg in "$@"; do
+  case "$arg" in
+    --trigger=*) TRIGGER_URL="${arg#*=}" ;;
+    --interval=*) POLL_INTERVAL="${arg#*=}" ;;
+    --install-dir=*) INSTALL_DIR="${arg#*=}" ;;
+    --state-dir=*) STATE_DIR="${arg#*=}" ;;
+    --logfile=*) LOGFILE="${arg#*=}" ;;
+    --pidfile=*) PIDFILE="${arg#*=}" ;;
+    --daemonize) DAEMONIZE=1 ;;
+    --once) CMD_ONCE=1 ;;
+    --stop) CMD_STOP=1 ;;
+    --status) CMD_STATUS=1 ;;
+    --health) CMD_HEALTH=1 ;;
+    --test) TEST_MODE=1 ;;
+    --install-url=*) CMD_INSTALL_URL="${arg#*=}" ;;
+    --sha256=*) CMD_INSTALL_SHA256="${arg#*=}" ;;
+    --name=*) CMD_INSTALL_NAME="${arg#*=}" ;;
+    -h|--help) usage; exit 0 ;;
+    --config=*) ;; # already handled
+    *) echo "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+done
+
+ensure_dirs
+
+# ——————————————————————————————————————————————————————————————————————
+# Downloader detection
+# ——————————————————————————————————————————————————————————————————————
+DL_TOOL=""
+if command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+elif command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+else
+  log "No downloader found. Installing wget..."
+  if command -v pkg >/dev/null 2>&1; then
+    yes | pkg update -y || true
+    yes | pkg install -y wget || die "Failed to install wget automatically."
+    DL_TOOL="wget"
+  else
+    die "Neither wget nor curl available, and 'pkg' not found."
+  fi
+fi
+
+dl_to_file() {
+  local url="$1" out="$2"
+  case "$DL_TOOL" in
+    wget) wget -q --show-progress -O "$out" "$url" ;;
+    curl) curl -fL --progress-bar -o "$out" "$url" ;;
+  esac
+}
+
+dl_to_stdout() {
+  local url="$1"
+  case "$DL_TOOL" in
+    wget) wget -q -O - "$url" ;;
+    curl) curl -fsSL "$url" ;;
+  esac
+}
+
+# ——————————————————————————————————————————————————————————————————————
+# JSON support (jq optional)
+# ——————————————————————————————————————————————————————————————————————
+JQ=""
+if command -v jq >/dev/null 2>&1; then
+  JQ="jq"
+else
+  log "jq not found. Attempting to install for JSON trigger parsing..."
+  if command -v pkg >/dev/null 2>&1; then
+    yes | pkg install -y jq || log "jq install failed; will fallback to plain-text trigger."
+    command -v jq >/dev/null 2>&1 && JQ="jq"
+  fi
+fi
+
+# ——————————————————————————————————————————————————————————————————————
+# Root/pm detection
+# ——————————————————————————————————————————————————————————————————————
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu -c"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  log "No root helper (tsu/su) found. Non-root install may fail or prompt."
+fi
+
+if ! command -v pm >/dev/null 2>&1; then
+  log "'pm' not found in PATH. APK installation may not work in this environment."
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+  log "sha256sum missing. Installing coreutils..."
+  if command -v pkg >/dev/null 2>&1; then
+    yes | pkg install -y coreutils || log "coreutils install failed; will skip checksum verification."
+  fi
+fi
+
+# ——————————————————————————————————————————————————————————————————————
+# Trigger parsing
+# ——————————————————————————————————————————————————————————————————————
+# Output via env lines:
+#   PARSE_INSTALL=0/1
+#   PARSE_APK_URL
+#   PARSE_SHA256
+#   PARSE_NONCE
+parse_trigger() {
+  local content; content="$(cat)"
+  local install="" apk_url="" sha256="" nonce=""
+
+  if [[ -n "$JQ" ]] && echo "$content" | $JQ . >/dev/null 2>&1; then
+    # JSON mode
+    local key
+    IFS=',' read -r -a install_keys <<<"$JSON_INSTALL_KEYS"
+    IFS=',' read -r -a url_keys <<<"$JSON_URL_KEYS"
+    IFS=',' read -r -a sha_keys <<<"$JSON_SHA256_KEYS"
+    IFS=',' read -r -a nonce_keys <<<"$JSON_NONCE_KEYS"
+
+    for key in "${install_keys[@]}"; do
+      install="$(echo "$content" | $JQ -r ".${key} // empty" 2>/dev/null || true)"; [[ -n "$install" ]] && break
+    done
+    for key in "${url_keys[@]}"; do
+      apk_url="$(echo "$content" | $JQ -r ".${key} // empty" 2>/dev/null || true)"; [[ -n "$apk_url" ]] && break
+    done
+    for key in "${sha_keys[@]}"; do
+      sha256="$(echo "$content" | $JQ -r ".${key} // empty" 2>/dev/null || true)"; [[ -n "$sha256" ]] && break
+    done
+    for key in "${nonce_keys[@]}"; do
+      nonce="$(echo "$content" | $JQ -r ".${key} // empty" 2>/dev/null || true)"; [[ -n "$nonce" ]] && break
+    done
+  else
+    # Plain text KEY=VALUE
+    install="$(echo "$content" | awk -F= '/^(INSTALL|install|ENABLED|enabled)=/ {print $2; exit}')"
+    apk_url="$(echo "$content" | awk -F= '/^(APK_URL|apk_url)=/ {print $2; exit}')"
+    sha256="$(echo "$content" | awk -F= '/^(SHA256|sha256)=/ {print $2; exit}')"
+    nonce="$(echo "$content" | awk -F= '/^(NONCE|nonce|VERSION|version)=/ {print $2; exit}')"
+  fi
+
+  case "${install,,}" in
+    1|y|yes|true|on|enable|enabled) install="1" ;;
+    *) install="0" ;;
+  esac
+
+  echo "PARSE_INSTALL=$install"
+  echo "PARSE_APK_URL=$apk_url"
+  echo "PARSE_SHA256=$sha256"
+  echo "PARSE_NONCE=$nonce"
+}
+
+# ——————————————————————————————————————————————————————————————————————
+# APK handling
+# ——————————————————————————————————————————————————————————————————————
+verify_sha256() {
+  local file="$1" expect="$2"
+  [[ -z "$expect" ]] && { echo "OK (no checksum provided)"; return 0; }
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "SKIP (sha256sum unavailable)"; return 0
+  fi
+  local got; got="$(sha256sum "$file" | awk '{print $1}')"
+  [[ "${got,,}" == "${expect,,}" ]] && { echo "OK"; return 0; } || { echo "MISMATCH (got $got)"; return 1; }
+}
+
+install_apk() {
+  local apk="$1"
+  if [[ "$TEST_MODE" -eq 1 ]]; then
+    log "[TEST] Would install: $apk"
+    return 0
+  fi
+  if [[ -n "$ROOT_CMD" ]]; then
+    if $ROOT_CMD "cmd package install -r --user 0 \"$apk\""; then
+      log "Installed via 'cmd package': $apk"; return 0
+    elif $ROOT_CMD "pm install -r --user 0 \"$apk\""; then
+      log "Installed via 'pm install': $apk"; return 0
+    else
+      die "Rooted installation failed for: $apk"
+    fi
+  else
+    if pm install -r --user 0 "$apk"; then
+      log "Installed without root (pm): $apk"; return 0
+    else
+      die "Installation failed (no root). Consider 'pkg install tsu' for rooted installs."
+    fi
+  fi
+}
+
+# ——————————————————————————————————————————————————————————————————————
+# Core operations
+# ——————————————————————————————————————————————————————————————————————
+LAST_NONCE_FILE="${STATE_DIR}/last_nonce"
+
+process_trigger_once() {
+  [[ -z "${TRIGGER_URL:-}" ]] && die "No --trigger URL provided."
+  [[ "$TRIGGER_URL" =~ ^https?:// ]] || die "Trigger URL must be http(s). Got: $TRIGGER_URL"
+
+  local tmp_trig; tmp_trig="$(mktemp "${STATE_DIR}/trigger.XXXXXX")"
+  trap 'rm -f "$tmp_trig"' RETURN
+
+  if ! dl_to_file "$TRIGGER_URL" "$tmp_trig"; then
+    log "Failed to fetch trigger: $TRIGGER_URL"; return 1
+  fi
+
+  eval "$(cat "$tmp_trig" | parse_trigger)"
+  local install="$PARSE_INSTALL" apk_url="$PARSE_APK_URL" sha256="$PARSE_SHA256" nonce="$PARSE_NONCE"
+
+  log "Trigger: install=$install apk_url=${apk_url:-<none>} sha256=${sha256:+provided} nonce=${nonce:-<none>}"
+
+  # Nonce gating
+  local last_nonce=""; [[ -f "$LAST_NONCE_FILE" ]] && last_nonce="$(cat "$LAST_NONCE_FILE" 2>/dev/null || true)"
+  if [[ -n "$nonce" && "$nonce" == "$last_nonce" ]]; then
+    log "Nonce unchanged; nothing to do."; return 0
+  fi
+
+  [[ "$install" == "1" ]] || { log "Install flag not set; nothing to do."; return 0; }
+  [[ -n "$apk_url" ]] || { log "Install requested but APK_URL missing."; return 1; }
+
+  # Download APK
+  local base; base="$(basename "$apk_url")"
+  local name="$base"; [[ "$name" == *.apk ]] || name="${name}.apk"
+  local out="${INSTALL_DIR}/${name}"
+
+  log "Downloading APK: $apk_url -> $out"
+  if ! dl_to_file "$apk_url" "$out"; then
+    log "Failed to download APK."; return 1
+  fi
+
+  # Verify
+  if [[ -n "$sha256" ]]; then
+    local verdict; verdict="$(verify_sha256 "$out" "$sha256")"
+    if [[ "$verdict" != "OK" && "$verdict" != "OK (no checksum provided)" && "$verdict" != "SKIP (sha256sum unavailable)" ]]; then
+      log "Checksum verification failed: $verdict"; return 1
+    else
+      log "Checksum: $verdict"
+    fi
+  fi
+
+  # Install
+  install_apk "$out"
+
+  # Record nonce
+  if [[ -n "$nonce" ]]; then
+    echo -n "$nonce" > "$LAST_NONCE_FILE"
+  else
+    echo -n "$name" > "$LAST_NONCE_FILE"
+  fi
+
+  log "Done."
+  return 0
+}
+
+install_direct_url() {
+  local url="$1" sha="$2" fname="$3"
+  [[ "$url" =~ ^https?:// ]] || die "--install-url must be http(s)"
+
+  local name; name="${fname:-$(basename "$url")}"
+  [[ "$name" == *.apk ]] || name="${name}.apk"
+  local out="${INSTALL_DIR}/${name}"
+
+  log "Downloading APK (direct): $url -> $out"
+  dl_to_file "$url" "$out" || die "Failed to download: $url"
+
+  if [[ -n "$sha" ]]; then
+    local verdict; verdict="$(verify_sha256 "$out" "$sha")"
+    [[ "$verdict" == "OK" || "$verdict" == "SKIP (sha256sum unavailable)" ]] || die "Checksum failed: $verdict"
+    log "Checksum: $verdict"
+  fi
+
+  install_apk "$out"
+  log "Direct install complete: $out"
+}
+
+monitor_loop() {
+  log "Starting monitor loop. Interval=${POLL_INTERVAL}s Trigger=${TRIGGER_URL}"
+  while true; do
+    if ! process_trigger_once; then
+      log "Cycle finished with errors."
+    fi
+    [[ "$CMD_ONCE" -eq 1 ]] && break
+    sleep "$POLL_INTERVAL"
+  done
+  log "Monitor loop exiting."
+}
+
+daemonize() {
+  if [[ -f "$PIDFILE" ]]; then
+    local oldpid; oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [[ -n "$oldpid" ]] && kill -0 "$oldpid" 2>/dev/null; then
+      die "Daemon already running (PID $oldpid). Use --stop first."
+    else
+      log "Removing stale PID file."; rm -f "$PIDFILE"
+    fi
+  fi
+  log "Daemonizing..."
+  nohup bash -c "
+    trap 'exit 0' INT TERM
+    exec \"$0\" --config=\"$CONFIG_FILE\" ${TRIGGER_URL:+--trigger=\"$TRIGGER_URL\"} --interval=\"$POLL_INTERVAL\" --install-dir=\"$INSTALL_DIR\" --state-dir=\"$STATE_DIR\" --logfile=\"$LOGFILE\" --pidfile=\"$PIDFILE\" ${TEST_MODE:+--test}
+  " >/dev/null 2>&1 &
+  echo $! > "$PIDFILE"
+  disown || true
+  log "Daemon started (PID $(cat "$PIDFILE"))."
+}
+
+print_status() {
+  if [[ -f "$PIDFILE" ]]; then
+    local pid; pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Running (PID $pid)"; return 0
+    else
+      echo "Not running (stale PID file at $PIDFILE)"; return 1
+    fi
+  else
+    echo "Not running"; return 1
+  fi
+}
+
+stop_daemon() {
+  if [[ -f "$PIDFILE" ]]; then
+    local pid; pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "Stopping daemon PID $pid"; kill "$pid" || true; sleep 0.5
+      if kill -0 "$pid" 2>/dev/null; then log "Force killing PID $pid"; kill -9 "$pid" || true; fi
+    else
+      log "No active process for PID file: $PIDFILE"
+    fi
+    rm -f "$PIDFILE"
+  else
+    log "No PID file found at $PIDFILE"
+  fi
+}
+
+print_health() {
+  cat <<EOF
+cryptic_termux health:
+  CONFIG_FILE:   $CONFIG_FILE
+  TRIGGER_URL:   ${TRIGGER_URL:-<unset>}
+  POLL_INTERVAL: $POLL_INTERVAL
+  INSTALL_DIR:   $INSTALL_DIR
+  STATE_DIR:     $STATE_DIR
+  LOGFILE:       $LOGFILE
+  PIDFILE:       $PIDFILE
+  LOG_MAX_SIZE:  $LOG_MAX_SIZE
+  TEST_MODE:     $TEST_MODE
+  DAEMONIZE:     $DAEMONIZE
+  Downloader:    $DL_TOOL
+  jq:            ${JQ:-<none>}
+  Root helper:   ${ROOT_CMD:-<none>}
+  pm present:    $(command -v pm >/dev/null 2>&1 && echo yes || echo no)
+EOF
+}
+
+# ——————————————————————————————————————————————————————————————————————
+# Command dispatch
+# ——————————————————————————————————————————————————————————————————————
+trap 'log "Interrupted"; exit 130' INT
+trap 'log "Terminated"; exit 143' TERM
+
+# Administrative commands first
+if [[ "$CMD_STATUS" -eq 1 ]]; then print_status; exit $?; fi
+if [[ "$CMD_STOP" -eq 1 ]]; then stop_daemon; exit 0; fi
+if [[ "$CMD_HEALTH" -eq 1 ]]; then print_health; exit 0; fi
+
+# Direct install mode
+if [[ -n "$CMD_INSTALL_URL" ]]; then
+  install_direct_url "$CMD_INSTALL_URL" "$CMD_INSTALL_SHA256" "$CMD_INSTALL_NAME"
+  exit 0
+fi
+
+# Normal trigger mode
+if [[ -z "${TRIGGER_URL:-}" ]]; then
+  usage; die "Missing required --trigger URL (or set in config)."
+fi
+
+if [[ "$DAEMONIZE" -eq 1 ]]; then
+  daemonize
+  exit 0
+else
+  monitor_loop
+fi
