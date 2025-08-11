@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# cryptic_termux.sh
+# One-time init + background watcher + interactive Reconnect with pause/resume.
+
+set -Eeuo pipefail
+
+# ----------------- Basic config -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"  # seconds
+
+# Trigger files (expect '0' or '1')
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}"
+SCRIPT_TRIGGER_URL="${SCRIPT_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}"
+
+# APK list
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# Config update
+JSON_SOURCE_URL="${JSON_SOURCE_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+JSON_DEST="${JSON_DEST:-/storage/emulated/0/cryptic/Workspace/SpeedHubX/Grow a Garden.json}"
+
+# Reconnect (interactive)
+RECONNECT_URL="${RECONNECT_URL:-http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT3juUiLhzmuVwX321098d1fgg}"
+RECONNECT_LUA="${RECONNECT_LUA:-/sdcard/download/reconnect.lua}"
+
+# State, locks, and pids
+STATE_FILE_CLONES="${WORKDIR}/.last_refresh_clones"
+STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script"
+PENDING_CLONES="${WORKDIR}/.pending_clones"
+PENDING_SCRIPT="${WORKDIR}/.pending_script"
+BUSY_LOCK="${WORKDIR}/.busy"
+INIT_MARKER="${WORKDIR}/.init_done"
+WATCHER_PIDFILE="${WORKDIR}/watcher.pid"
+RECONNECT_PIDFILE="${WORKDIR}/reconnect.pid"
+CONTROLLER_PIDFILE="${WORKDIR}/controller.pid"
+
+# ----------------- Utilities -----------------
+mkdir -p "$WORKDIR"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+ensure_storage() {
+  if [ ! -d "/sdcard" ] || [ ! -d "/sdcard/download" ]; then
+    command -v termux-setup-storage >/dev/null 2>&1 && termux-setup-storage >/dev/null 2>&1 || true
+    mkdir -p /sdcard/download 2>/dev/null || true
+  fi
+}
+
+# Prevent duplicate controller instances (helps with Termux:Boot or repeated launches)
+if [ -f "$CONTROLLER_PIDFILE" ]; then
+  oldpid="$(cat "$CONTROLLER_PIDFILE" 2>/dev/null || true)"
+  if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
+    log "Another instance is already running (PID $oldpid). Exiting."
+    exit 0
+  fi
+fi
+echo "$$" > "$CONTROLLER_PIDFILE"
+
+cleanup_all() {
+  rm -f "$CONTROLLER_PIDFILE" "$BUSY_LOCK" 2>/dev/null || true
+}
+trap cleanup_all EXIT
+
+# ----------------- Downloader -----------------
+DL_TOOL=""
+install_if_needed() {
+  # best-effort Termux pkg install
+  command -v pkg >/dev/null 2>&1 || return 0
+  pkg update -y >/dev/null 2>&1 || true
+  pkg install -y "$@" >/dev/null 2>&1 || true
+}
+
+pick_downloader() {
+  if command -v curl >/dev/null 2>&1; then
+    DL_TOOL="curl"
+  elif command -v wget >/dev/null 2>&1; then
+    DL_TOOL="wget"
+  else
+    install_if_needed curl
+    if command -v curl >/dev/null 2>&1; then
+      DL_TOOL="curl"
+    else
+      install_if_needed wget
+      if command -v wget >/dev/null 2>&1; then
+        DL_TOOL="wget"
+      else
+        log "No curl/wget available. Install one and re-run."
+        exit 1
+      fi
+    fi
+  fi
+  log "Downloader: $DL_TOOL"
+}
+
+download_file() {
+  local url="$1" out="$2"
+  if [ "$DL_TOOL" = "curl" ]; then
+    curl -fsSL -C - -o "$out" "$url"
+  else
+    wget -q --show-progress -c -O "$out" "$url"
+  fi
+}
+
+get_remote_flag() {
+  local url="$1" content=""
+  if [ "$DL_TOOL" = "curl" ]; then
+    content="$(curl -fsSL "$url" 2>/dev/null || true)"
+  else
+    content="$(wget -qO- "$url" 2>/dev/null || true)"
+  fi
+  content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
+  case "$content" in
+    0|1) printf '%s' "$content" ;;
+    *) printf '' ;;
+  esac
+}
+
+# ----------------- One-time initialization -----------------
+ensure_lua() {
+  command -v lua >/dev/null 2>&1 && return 0
+  install_if_needed lua
+  command -v lua >/dev/null 2>&1 || return 1
+}
+
+ensure_root_hint() {
+  if command -v tsu >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v su >/dev/null 2>&1; then
+    return 0
+  fi
+  # Not fatal, but warn once.
+  log "Note: No root found (tsu/su). Silent pm installs may fail."
+}
+
+init_once() {
+  if [ -f "$INIT_MARKER" ]; then
+    return 0
+  fi
+  echo
+  echo "Setting up... Initializing dependencies..."
+  ensure_storage
+  pick_downloader
+  ensure_lua || log "Lua not found after install attempt; Reconnect may not run until installed."
+  ensure_root_hint
+  touch "$INIT_MARKER"
+  echo "Initialization complete."
+  echo
+}
+
+# ----------------- Root + installs -----------------
+install_apk_root() {
+  local apk="$1"
+  if command -v tsu >/dev/null 2>&1; then
+    tsu pm install -r -g "$apk"
+  elif command -v su >/dev/null 2>&1; then
+    su -c "pm install -r -g '$apk'"
+  else
+    log "Skipping install (no root): $apk"
+    return 1
+  fi
+}
+
+do_downloads_and_installs() {
+  log "Starting APK batch ..."
+  for url in "${LINKS[@]}"; do
+    local fname="${url##*/}"
+    log "Downloading: $fname"
+    download_file "$url" "$WORKDIR/$fname" || { log "Download failed: $fname"; continue; }
+    if [ ! -s "$WORKDIR/$fname" ]; then
+      log "Empty file, skipping: $fname"
+      continue
+    fi
+    log "Installing: $fname"
+    if install_apk_root "$WORKDIR/$fname"; then
+      log "Installed: $fname"
+    else
+      log "Install failed (no root or error): $fname"
+    fi
+  done
+  log "APK batch complete."
+}
+
+update_json_from_remote() {
+  log "Updating JSON -> $JSON_DEST"
+  local tmp="$WORKDIR/SpeedHubX.Config.json.tmp"
+  download_file "$JSON_SOURCE_URL" "$tmp" || { log "JSON download failed"; return 1; }
+  if [ ! -s "$tmp" ]; then
+    log "JSON is empty. Aborting."
+    return 1
+  fi
+  local dest_dir; dest_dir="$(dirname "$JSON_DEST")"
+  if command -v tsu >/dev/null 2>&1; then
+    tsu -- sh -c "mkdir -p '$dest_dir' && cp -f '$tmp' '$JSON_DEST'"
+  elif command -v su >/dev/null 2>&1; then
+    su -c "mkdir -p '$dest_dir' && cp -f '$tmp' '$JSON_DEST'"
+  else
+    mkdir -p "$dest_dir" 2>/dev/null || true
+    cp -f "$tmp" "$JSON_DEST" 2>/dev/null || { log "Copy failed (no root?)"; return 1; }
+  fi
+  log "JSON updated."
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+# ----------------- Reconnect (interactive, pause/resume) -----------------
+fetch_reconnect() {
+  ensure_storage
+  if [ "$DL_TOOL" = "curl" ]; then
+    curl -fsSL -o "$RECONNECT_LUA" "$RECONNECT_URL"
+  else
+    wget -q -O "$RECONNECT_LUA" "$RECONNECT_URL"
+  fi
+  [ -s "$RECONNECT_LUA" ]
+}
+
+start_reconnect_foreground() {
+  fetch_reconnect || { log "Reconnect script failed to download."; return 1; }
+  echo
+  echo "▶️ Resuming Reconnect..."
+  echo "Script: $RECONNECT_LUA"
+  echo
+
+  # Launch in foreground but track PID so we can stop it on demand.
+  # Wrapper PID persists across exec, becoming lua's PID.
+  bash -c 'echo $$ > "$0"; exec lua "$1"' "$RECONNECT_PIDFILE" "$RECONNECT_LUA"
+}
+
+stop_reconnect_if_running() {
+  if [ -f "$RECONNECT_PIDFILE" ]; then
+    local pid; pid="$(cat "$RECONNECT_PIDFILE" 2>/dev/null || true)"
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "⏸ Paused for update..."
+      kill "$pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do sleep 0.2; kill -0 "$pid" 2>/dev/null || break; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$RECONNECT_PIDFILE" 2>/dev/null || true
+  fi
+}
+
+# ----------------- Watcher (background) -----------------
+run_watcher_bg() {
+  local parent_pid="$1"
+  local last_clones="" last_script=""
+  [ -f "$STATE_FILE_CLONES" ] && last_clones="$(cat "$STATE_FILE_CLONES" 2>/dev/null || true)"
+  [ -f "$STATE_FILE_SCRIPT" ] && last_script="$(cat "$STATE_FILE_SCRIPT" 2>/dev/null || true)"
+
+  log "Watcher started. Poll interval: ${POLL_INTERVAL}s"
+  log "Triggers: clones=$TRIGGER_URL (last='$last_clones'), script=$SCRIPT_TRIGGER_URL (last='$last_script')"
+
+  while true; do
+    local remote_clones remote_script
+    remote_clones="$(get_remote_flag "$TRIGGER_URL")"
+    remote_script="$(get_remote_flag "$SCRIPT_TRIGGER_URL")"
+
+    if [ -n "$remote_clones" ] && [ "$remote_clones" != "$last_clones" ]; then
+      printf '%s' "$remote_clones" > "$STATE_FILE_CLONES"; last_clones="$remote_clones"
+      if [ "$remote_clones" = "1" ] && [ ! -f "$BUSY_LOCK" ] && [ ! -f "$PENDING_CLONES" ]; then
+        : > "$PENDING_CLONES"
+        kill -USR1 "$parent_pid" 2>/dev/null || true
+      fi
+    fi
+
+    if [ -n "$remote_script" ] && [ "$remote_script" != "$last_script" ]; then
+      printf '%s' "$remote_script" > "$STATE_FILE_SCRIPT"; last_script="$remote_script"
+      if [ "$remote_script" = "1" ] && [ ! -f "$BUSY_LOCK" ] && [ ! -f "$PENDING_SCRIPT" ]; then
+        : > "$PENDING_SCRIPT"
+        kill -USR1 "$parent_pid" 2>/dev/null || true
+      fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+start_watcher_bg() {
+  if [ -f "$WATCHER_PIDFILE" ]; then
+    local old; old="$(cat "$WATCHER_PIDFILE" 2>/dev/null || true)"
+    if [ -n "${old:-}" ] && kill -0 "$old" 2>/dev/null; then
+      log "Watcher already running (PID $old)."
+      return 0
+    fi
+  fi
+  ( run_watcher_bg "$$" ) &
+  echo $! > "$WATCHER_PIDFILE"
+  log "Watcher PID $(cat "$WATCHER_PIDFILE")."
+}
+
+stop_watcher_bg() {
+  [ -f "$WATCHER_PIDFILE" ] || return 0
+  local pid; pid="$(cat "$WATCHER_PIDFILE" 2>/dev/null || true)"
+  [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+  rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
+}
+
+# ----------------- Orchestration -----------------
+NEED_WORK=0
+on_usr1() {
+  NEED_WORK=1
+  stop_reconnect_if_running
+}
+trap on_usr1 USR1
+trap 'stop_reconnect_if_running; stop_watcher_bg; exit 0' INT TERM
+
+process_pending_work() {
+  [ -f "$PENDING_CLONES" ] || [ -f "$PENDING_SCRIPT" ] || return 0
+  : > "$BUSY_LOCK"
+
+  if [ -f "$PENDING_CLONES" ]; then
+    rm -f "$PENDING_CLONES"
+    do_downloads_and_installs
+  fi
+  if [ -f "$PENDING_SCRIPT" ]; then
+    rm -f "$PENDING_SCRIPT"
+    update_json_from_remote
+  fi
+
+  rm -f "$BUSY_LOCK" 2>/dev/null || true
+}
+
+# ----------------- Main -----------------
+init_once
+pick_downloader
+start_watcher_bg
+
+# If work is already pending at boot, handle it before first Reconnect launch
+sleep 1
+process_pending_work
+
+# Loop: run Reconnect in foreground when idle; pause for updates; then resume.
+while true; do
+  NEED_WORK=0
+  start_reconnect_foreground || true
+  process_pending_work
+  # If Reconnect exited on its own and no work is pending, loop will relaunch it.
+done
