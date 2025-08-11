@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# install_cryptics_daemon.sh
+# One-shot installer + dual-trigger daemon for Android/Termux (Android 10 compatible).
+# - 8 APK installs (silent root)
+# - JSON replacement
+# - Reconnect controller (foreground by default)
+# - Robust downloads & retries
+# - KEEP_APKS, --test, --daemonize, --pidfile, --logfile
+set -u
+
+# ----------------- Configuration (env-overridable) -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"                  # 0: delete APKs after install, 1: keep
+POLL_INTERVAL="${POLL_INTERVAL:-30}"         # seconds between checks
+
+# Triggers (raw URLs for reliable 0/1 content)
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}"
+SCRIPT_TRIGGER_URL="${SCRIPT_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}"
+
+# JSON source and destination
+CONFIG_JSON_SOURCE_URL="${CONFIG_JSON_SOURCE_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+DEST_DIR="${DEST_DIR:-/storage/emulated/0/Cryptic/Workspace/SpeedHubX}"
+DEST_FILE_NAME="${DEST_FILE_NAME:-Grow a Garden.json}"
+
+# State files
+CLONES_STATE_FILE="${WORKDIR}/.last_refresh_clones_state"
+SCRIPT_STATE_FILE="${WORKDIR}/.last_refresh_script_state"
+
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
+# Reconnect script
+RECONNECT_URL="${RECONNECT_URL:-http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg}"
+RECONNECT_PATH="${RECONNECT_PATH:-/sdcard/download/reconnect.lua}"
+
+# Reconnect run mode:
+#   foreground  - run in the foreground (daemon pauses until you exit reconnect)
+#   background  - run detached (nohup) [not default, per your request]
+RECONNECT_RUN_MODE="${RECONNECT_RUN_MODE:-foreground}"
+
+# APK links
+LINKS=(
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# ----------------- CLI parsing -----------------
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize           Run as background daemon (nohup; writes PID & log)
+  --pidfile <path>      PID file (default: ${PIDFILE_DEFAULT})
+  --logfile <path>      Log file (default: ${LOGFILE_DEFAULT})
+  --test                Test mode: only the first APK once, then exit
+  --help                Show this help and exit
+
+Environment variables:
+  WORKDIR, KEEP_APKS, POLL_INTERVAL
+  TRIGGER_URL, SCRIPT_TRIGGER_URL
+  CONFIG_JSON_SOURCE_URL
+  DEST_DIR, DEST_FILE_NAME
+  RECONNECT_URL, RECONNECT_PATH, RECONNECT_RUN_MODE=foreground|background
+
+Examples:
+  $0 --test
+  $0 --daemonize
+  POLL_INTERVAL=10 KEEP_APKS=1 $0 --daemonize --logfile /sdcard/cryptic_log.txt
+EOF
+}
+
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    --daemonize) DAEMONIZE=1 ;;
+    --pidfile) i=$((i+1)); PIDFILE="${!i:-}";;
+    --logfile) i=$((i+1)); LOGFILE="${!i:-}";;
+    --test) TEST_MODE=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+  i=$((i+1))
+done
+
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+# ----------------- Helpers -----------------
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
+
+log() {
+  # Portable timestamp across busybox/toybox/coreutils
+  printf '[%s] %s\n' "$(date +'%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date)" "$*"
+}
+
+# ----------------- Daemonize (parent spawns child) -----------------
+if [ "$DAEMONIZE" = 1 ]; then
+  # prevent duplicate
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "Daemon already running (PID $oldpid). Exiting."
+      exit 0
+    else
+      rm -f "$PIDFILE" 2>/dev/null || true
+    fi
+  fi
+  mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid). Log: $LOGFILE  PID: $PIDFILE"
+  exit 0
+fi
+
+# record pid, cleanup on exit
+printf '%s' "$$" > "$PIDFILE" 2>/dev/null || true
+trap 'if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then rm -f "$PIDFILE"; fi; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
+
+# ----------------- Ensure basic tools (Android 10 friendly) -----------------
+ensure_pkg() {
+  local bin="$1" pkgname="${2:-$1}"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    log "Installing missing dependency: $pkgname"
+    (pkg update -y >/dev/null 2>&1 || true)
+    pkg install -y "$pkgname" >/dev/null 2>&1 || true
+  fi
+}
+
+# downloader selection
+DL=""; UA="Mozilla/5.0 (Linux; Android 10; Termux) AppleWebKit/537.36 Chrome/110 Safari/537.36"
+if command -v curl >/dev/null 2>&1; then
+  DL="curl"
+elif command -v wget >/dev/null 2>&1; then
+  DL="wget"
+else
+  ensure_pkg wget wget
+  if command -v wget >/dev/null 2>&1; then
+    DL="wget"
+  else
+    ensure_pkg curl curl
+    command -v curl >/dev/null 2>&1 && DL="curl"
+  fi
+fi
+if [ -z "$DL" ]; then
+  log "Failed to obtain curl/wget. Install one and re-run."
+  exit 1
+fi
+log "Using downloader: $DL"
+
+# root helper
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu -c"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  log "No root helper (tsu or su) found. Root is required for silent installs."
+  log "Install tsu (pkg install tsu) or ensure su is available, then re-run."
+  exit 1
+fi
+log "Using root command: ${ROOT_CMD%% *}"
+
+# lua (for reconnect)
+ensure_pkg lua lua
+
+# storage check (Android 10 scoped storage)
+if [ ! -d "/storage/emulated/0" ] || [ ! -w "/storage/emulated/0" ]; then
+  log "Note: /storage/emulated/0 not accessible. Run: termux-setup-storage"
+fi
+
+# ----------------- Network helpers -----------------
+download_file() {
+  # download_file <url> <output_path>
+  local url="$1" out="$2" rc=0
+  if [ "$DL" = "curl" ]; then
+    curl -A "$UA" -L --fail --retry 3 --retry-delay 2 --connect-timeout 20 -o "$out" "$url" || rc=$?
+  else
+    wget --user-agent="$UA" --tries=3 --timeout=20 -O "$out" "$url" || rc=$?
+  fi
+  return $rc
+}
+
+fetch_flag_01() {
+  # Prints 0 or 1 from URL (first non-space char), empty on error
+  local url="$1" content=""
+  if [ "$DL" = "curl" ]; then
+    content="$(curl -A "$UA" -fsSL "$url" 2>/dev/null || true)"
+  else
+    content="$(wget -qO- "$url" 2>/dev/null || true)"
+  fi
+  content="$(printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 || true)"
+  case "$content" in
+    0|1) printf '%s' "$content";;
+    *) printf '';;
+  esac
+}
+
+# ----------------- APK install (Android 10 hardened) -----------------
+install_apk_root() {
+  # Try multiple strategies for Android 10 shell installs
+  local apk="$1"
+  local cmd rc=0
+
+  # 1) pm install
+  cmd="$ROOT_CMD \"pm install -r -g --user 0 '$apk'\""
+  eval $cmd >/dev/null 2>&1 || rc=$?
+
+  if [ $rc -ne 0 ]; then
+    rc=0
+    # 2) cmd package install
+    cmd="$ROOT_CMD \"cmd package install -r -g --user 0 '$apk'\""
+    eval $cmd >/dev/null 2>&1 || rc=$?
+  fi
+
+  if [ $rc -ne 0 ]; then
+    rc=0
+    # 3) pm install without --user (legacy fallback)
+    cmd="$ROOT_CMD \"pm install -r -g '$apk'\""
+    eval $cmd >/dev/null 2>&1 || rc=$?
+  fi
+
+  return $rc
+}
+
+# ----------------- Core tasks -----------------
+do_downloads_and_installs() {
+  log "Starting APK downloads and installs in $WORKDIR"
+  for url in "${LINKS[@]}"; do
+    fname="${url##*/}"
+    [ -f "$fname" ] && [ ! -s "$fname" ] && { log "Removing zero-size $fname"; rm -f "$fname"; }
+    log "Downloading: $fname"
+    if ! download_file "$url" "$fname"; then
+      log "Download failed for $fname"
+      continue
+    fi
+    if [ ! -s "$fname" ]; then
+      log "Downloaded $fname is empty. Skipping."
+      continue
+    fi
+    size_bytes=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
+    log "Downloaded $fname (${size_bytes} bytes). Installing..."
+    if install_apk_root "$PWD/$fname"; then
+      log "Installed $fname successfully."
+      if [ "$KEEP_APKS" = "0" ]; then
+        rm -f "$fname"
+        log "Removed $fname (KEEP_APKS=0)."
+      else
+        log "Keeping $fname (KEEP_APKS=1)."
+      fi
+    else
+      log "Installation failed for $fname (Android 10)."
+    fi
+  done
+  log "APK task complete."
+}
+
+do_json_replace() {
+  local dest_path="${DEST_DIR}/${DEST_FILE_NAME}"
+  local tmp="${WORKDIR}/SpeedHubX.Config.json.tmp"
+
+  log "Replacing JSON at: $dest_path"
+  mkdir -p "$DEST_DIR" 2>/dev/null || true
+
+  log "Downloading source JSON..."
+  if ! download_file "$CONFIG_JSON_SOURCE_URL" "$tmp"; then
+    log "Failed to download source JSON"
+    return 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    log "Source JSON is empty"
+    return 1
+  fi
+
+  # Write atomically (via temp + move)
+  if cp -f "$tmp" "$dest_path"; then
+    bytes=$(stat -c%s "$tmp" 2>/dev/null || ls -l "$tmp" | awk '{print $5}')
+    log "Updated $(basename "$dest_path") with ${bytes} bytes."
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  else
+    log "Failed to write destination: $dest_path (check storage permission)"
+    return 1
+  fi
+}
+
+# ----------------- Reconnect controller -----------------
+stop_reconnect() {
+  log "Stopping reconnect (if running)..."
+  # Kill any lua process referencing reconnect.lua
+  local pids
+  pids="$( (ps 2>/dev/null || true) | grep -F 'reconnect.lua' | grep -v grep | awk '{print $1}' )"
+  if [ -n "${pids:-}" ]; then
+    for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+    sleep 0.5
+    for pid in $pids; do kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true; done
+    log "Reconnect terminated."
+  else
+    log "Reconnect not running."
+  fi
+}
+
+start_reconnect() {
+  log "Fetching reconnect.lua..."
+  mkdir -p "$(dirname "$RECONNECT_PATH")" 2>/dev/null || true
+
+  # Prefer curl for this one as specified
+  if command -v curl >/dev/null 2>&1; then
+    curl -A "$UA" -L --fail --retry 3 --retry-delay 2 -o "$RECONNECT_PATH" "$RECONNECT_URL"
+  else
+    download_file "$RECONNECT_URL" "$RECONNECT_PATH"
+  fi
+
+  if [ ! -s "$RECONNECT_PATH" ]; then
+    log "Failed to download reconnect.lua"
+    return 1
+  fi
+
+  case "$RECONNECT_RUN_MODE" in
+    foreground)
+      log "Launching reconnect in FOREGROUND. Daemon will pause until it exits."
+      lua "$RECONNECT_PATH"
+      log "Reconnect exited; daemon resuming."
+      ;;
+    background)
+      log "Launching reconnect in BACKGROUND."
+      nohup lua "$RECONNECT_PATH" >/dev/null 2>&1 &
+      log "Reconnect launched in background."
+      ;;
+    *)
+      log "Unknown RECONNECT_RUN_MODE='$RECONNECT_RUN_MODE'. Defaulting to foreground."
+      lua "$RECONNECT_PATH"
+      ;;
+  esac
+}
+
+# ----------------- TEST mode -----------------
+if [ "$TEST_MODE" = 1 ]; then
+  log "TEST MODE: only first APK once."
+  if [ ${#LINKS[@]} -gt 0 ]; then
+    LINKS=("${LINKS[0]}")
+  fi
+  do_downloads_and_installs
+  exit 0
+fi
+
+# ----------------- Initial state -----------------
+last_clones=""
+last_script=""
+[ -f "$CLONES_STATE_FILE" ] && last_clones="$(cat "$CLONES_STATE_FILE" 2>/dev/null || true)"
+[ -f "$SCRIPT_STATE_FILE" ] && last_script="$(cat "$SCRIPT_STATE_FILE" 2>/dev/null || true)"
+last_clones="${last_clones:-}"
+last_script="${last_script:-}"
+
+log "Daemon starting."
+log "Clones trigger: $TRIGGER_URL"
+log "JSON trigger:   $SCRIPT_TRIGGER_URL"
+log "Polling every ${POLL_INTERVAL}s. States: clones='${last_clones}' script='${last_script}'. Log: ${LOGFILE}"
+
+# ----------------- Main loop -----------------
+while true; do
+  clones_remote="$(fetch_flag_01 "$TRIGGER_URL")"
+  script_remote="$(fetch_flag_01 "$SCRIPT_TRIGGER_URL")"
+
+  [ -z "$clones_remote" ] && log "Warn: could not fetch clones trigger."
+  [ -z "$script_remote" ] && log "Warn: could not fetch JSON trigger."
+
+  run_apks=0
+  run_json=0
+
+  if [ -n "$clones_remote" ] && [ "$clones_remote" != "$last_clones" ]; then
+    log "Clones state: '$last_clones' -> '$clones_remote'"
+    if [ "$clones_remote" = "1" ]; then run_apks=1; else log "Clones now idle."; fi
+    printf '%s' "$clones_remote" > "$CLONES_STATE_FILE"
+    last_clones="$clones_remote"
+  fi
+
+  if [ -n "$script_remote" ] && [ "$script_remote" != "$last_script" ]; then
+    log "JSON state: '$last_script' -> '$script_remote'"
+    if [ "$script_remote" = "1" ]; then run_json=1; else log "JSON now idle."; fi
+    printf '%s' "$script_remote" > "$SCRIPT_STATE_FILE"
+    last_script="$script_remote"
+  fi
+
+  if [ $run_apks -eq 1 ] || [ $run_json -eq 1 ]; then
+    stop_reconnect
+
+    if [ $run_apks -eq 1 ]; then
+      do_downloads_and_installs
+    fi
+
+    if [ $run_json -eq 1 ]; then
+      if ! do_json_replace; then
+        log "JSON replacement encountered errors."
+      fi
+    fi
+
+    # After all work, launch reconnect per configured mode
+    start_reconnect
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
