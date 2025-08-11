@@ -1,0 +1,262 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux Android Automation: APK + JSON + Post Script
+# Stable, standalone, sequential (no background), trigger-controlled runs.
+# Android 10 / Root available via Magisk/VMOS supported.
+
+set -Eeuo pipefail
+
+############################################
+# Config
+############################################
+
+# APK URLs to download and install
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# Triggers (use RAW links for consistent machine parsing)
+APK_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt"
+JSON_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt"
+
+# JSON resource and destination
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+DEST_JSON="$HOME/Grow a Garden.json"
+
+# Optional post-action script to run when prior tasks complete this run
+# Leave empty "" to skip. Example: POST_SCRIPT="$HOME/post_done.sh"
+POST_SCRIPT=""
+
+# Where to keep logs/backups/locks
+STATE_DIR="$HOME/.termux-automation"
+LOG_DIR="$STATE_DIR/logs"
+BACKUP_DIR="$STATE_DIR/backups"
+LOCK_FILE="$STATE_DIR/run.lock"
+LOG_FILE="$LOG_DIR/$(date +'%Y%m%d_%H%M%S').log"
+
+# Retries and timeouts
+CURL_RETRIES=3
+CURL_TIMEOUT=20
+
+############################################
+# Helpers
+############################################
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$BACKUP_DIR"
+
+log() {
+  printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*" | tee -a "$LOG_FILE"
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+# Acquire an exclusive lock to avoid interference from parallel runs
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    fail "Another run is in progress. Try again later."
+  fi
+}
+
+cleanup() {
+  [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]] && rm -rf "$TMPDIR" || true
+}
+trap cleanup EXIT
+
+download_file() {
+  local url="$1" dest="$2"
+  curl -fL --retry "$CURL_RETRIES" --retry-all-errors --connect-timeout "$CURL_TIMEOUT" \
+       -o "$dest" "$url"
+}
+
+read_trigger() {
+  local url="$1"
+  local value
+  value="$(curl -fsSL --connect-timeout "$CURL_TIMEOUT" "$url" | tr -d '\r' | tr -d ' \t' | head -n 1 || true)"
+  case "$value" in
+    1|0) printf '%s' "$value" ;;
+    *)   printf '0' ;; # default safe: treat unknown as 0
+  esac
+}
+
+is_root_available() {
+  command -v su >/dev/null 2>&1
+}
+
+pm_install_with() {
+  # Try several install methods, preferring root for reliability
+  local apk="$1"
+  if is_root_available; then
+    # Rooted path
+    if su -c "pm install -r --user 0 \"$apk\"" >/dev/null 2>&1; then
+      return 0
+    fi
+    if su -c "cmd package install -r \"$apk\"" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  # Non-root fallback (may fail on some devices if permission not granted)
+  if pm install -r --user 0 "$apk" >/dev/null 2>&1; then
+    return 0
+  fi
+  if cmd package install -r "$apk" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+install_apk() {
+  local apk="$1"
+  log "Installing: $apk"
+  if pm_install_with "$apk"; then
+    log "Installed OK: $apk"
+  else
+    fail "Failed to install APK: $apk"
+  fi
+}
+
+ensure_tools() {
+  # Core tools
+  need_cmd curl
+  need_cmd sed
+  need_cmd grep
+  need_cmd awk
+  need_cmd tee
+  # jq is optional but recommended for JSON validation; try to install if missing
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq not found; attempting to install via pkg..."
+    if command -v pkg >/dev/null 2>&1; then
+      yes | pkg update || true
+      yes | pkg install jq || true
+    fi
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq unavailable; will copy JSON without validation."
+  fi
+}
+
+run_post_script() {
+  local script="$1"
+  if [[ -z "$script" ]]; then
+    log "Post script not set; skipping."
+    return 0
+  fi
+  if [[ ! -x "$script" ]]; then
+    fail "Post script not executable: $script"
+  fi
+  log "Running post script (foreground): $script"
+  "$script"
+  log "Post script completed."
+}
+
+############################################
+# Main
+############################################
+
+acquire_lock
+ensure_tools
+
+TMPDIR="$(mktemp -d)"
+log "Starting automation run."
+log "Log file: $LOG_FILE"
+
+# Read triggers
+APK_TRIG="$(read_trigger "$APK_TRIGGER_URL")"
+JSON_TRIG="$(read_trigger "$JSON_TRIGGER_URL")"
+log "Triggers => APK: $APK_TRIG | JSON: $JSON_TRIG"
+
+# These flags indicate whether a task actually ran in this invocation
+apk_ran=0
+json_ran=0
+
+# APK RELATED
+if [[ "$APK_TRIG" == "1" ]]; then
+  log "APK trigger is 1 — will download and install APKs."
+  apk_dl_dir="$TMPDIR/apks"
+  mkdir -p "$apk_dl_dir"
+
+  idx=0
+  for url in "${APK_URLS[@]}"; do
+    idx=$((idx+1))
+    fname="$apk_dl_dir/$(printf '%02d' "$idx")-$(basename "$url")"
+    log "Downloading APK ($idx/${#APK_URLS[@]}): $url"
+    download_file "$url" "$fname"
+    if [[ ! -s "$fname" ]]; then
+      fail "Downloaded file is empty: $fname"
+    fi
+  done
+
+  # Install after all downloads succeed
+  for apk in "$apk_dl_dir"/*.apk; do
+    install_apk "$apk"
+  done
+
+  apk_ran=1
+  log "APK task completed."
+else
+  log "APK trigger is 0 — skipping APK task."
+fi
+
+# JSON RELATED
+if [[ "$JSON_TRIG" == "1" ]]; then
+  log "JSON trigger is 1 — will download and replace destination JSON."
+  tmp_json="$TMPDIR/source.json"
+  download_file "$JSON_URL" "$tmp_json"
+  if [[ ! -s "$tmp_json" ]]; then
+    fail "Downloaded JSON is empty."
+  fi
+
+  # Optional validation
+  if command -v jq >/dev/null 2>&1; then
+    if ! jq empty "$tmp_json" >/dev/null 2>&1; then
+      fail "Downloaded JSON failed validation."
+    fi
+  else
+    log "Skipping JSON validation (jq not available)."
+  fi
+
+  # Backup existing file (if any)
+  if [[ -f "$DEST_JSON" ]]; then
+    ts="$(date +'%Y%m%d_%H%M%S')"
+    cp -f "$DEST_JSON" "$BACKUP_DIR/$(basename "$DEST_JSON").$ts.bak"
+    log "Backed up existing JSON to: $BACKUP_DIR/$(basename "$DEST_JSON").$ts.bak"
+  fi
+
+  # Replace contents
+  mkdir -p "$(dirname "$DEST_JSON")"
+  cp -f "$tmp_json" "$DEST_JSON"
+  sync || true
+  log "Replaced destination JSON: $DEST_JSON"
+
+  json_ran=1
+  log "JSON task completed."
+else
+  log "JSON trigger is 0 — skipping JSON task."
+fi
+
+# OTHER RELATED
+# Only run the post script if ANY of the above tasks actually ran in THIS invocation.
+# This guarantees it runs after everything is done, in foreground, and never concurrently.
+# It is naturally "disabled" when a trigger is 1 at the start of a run, because we only
+# execute it after completing those tasks first.
+if [[ "$apk_ran" -eq 1 || "$json_ran" -eq 1 ]]; then
+  run_post_script "$POST_SCRIPT"
+else
+  log "No tasks ran this time; post script will not run."
+fi
+
+log "All done."
+exit 0
