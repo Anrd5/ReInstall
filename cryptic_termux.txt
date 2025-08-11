@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# cryptic_daemon.sh — watches triggers, installs APKs, updates config,
+# and manages reconnect tool intelligently.
+
+set -u
+
+# ----------------- Basic config -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"  # seconds
+
+# Trigger files (expect '0' or '1')
+TRIGGER_URL="${TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt}"
+SCRIPT_TRIGGER_URL="${SCRIPT_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt}"
+
+# APK list
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# Config update
+JSON_SOURCE_URL="${JSON_SOURCE_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+JSON_DEST="${JSON_DEST:-/storage/emulated/0/cryptic/Workspace/SpeedHubX/Grow a Garden.json}"
+
+# Reconnect tool
+RECONNECT_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+RECONNECT_LUA="/sdcard/download/reconnect.lua"
+RECONNECT_LOG="$HOME/reconnect.log"
+RECONNECT_PIDFILE="$WORKDIR/reconnect_sidecar.pid"
+
+# State files
+STATE_FILE_CLONES="${WORKDIR}/.last_refresh_clones"
+STATE_FILE_SCRIPT="${WORKDIR}/.last_refresh_script"
+
+# ----------------- Setup -----------------
+mkdir -p "$WORKDIR"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+ensure_storage() {
+  if [ ! -d "/sdcard/download" ]; then
+    command -v termux-setup-storage >/dev/null 2>&1 && termux-setup-storage
+    mkdir -p /sdcard/download
+  fi
+}
+
+# Downloader
+DL_TOOL=""
+if command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+elif command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+else
+  command -v pkg >/dev/null 2>&1 && pkg update -y && pkg install -y curl
+  DL_TOOL=$(command -v curl || command -v wget || echo "")
+fi
+
+download_file() {
+  local url="$1" out="$2"
+  if [ "$DL_TOOL" = "curl" ]; then
+    curl -L -C - -o "$out" "$url"
+  else
+    wget -c -O "$out" "$url"
+  fi
+}
+
+get_remote_flag() {
+  local url="$1" content
+  if [ "$DL_TOOL" = "curl" ]; then
+    content="$(curl -fsSL "$url" 2>/dev/null || true)"
+  else
+    content="$(wget -qO- "$url" 2>/dev/null || true)"
+  fi
+  printf '%s' "$content" | tr -d ' \t\r\n' | cut -c1 | grep -E '^[01]$' || echo ""
+}
+
+# ----------------- Root helper -----------------
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu --"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+fi
+
+install_apk_root() {
+  local apk="$1"
+  if [ -z "$ROOT_CMD" ]; then
+    log "Skipping install (no root): $apk"
+    return 1
+  fi
+  $ROOT_CMD pm install -r -g "$apk"
+}
+
+# ----------------- Reconnect sidecar -----------------
+start_reconnect_sidecar() {
+  ensure_storage
+  if [ -f "$RECONNECT_PIDFILE" ]; then
+    local oldpid=$(<"$RECONNECT_PIDFILE")
+    if kill -0 "$oldpid" 2>/dev/null; then
+      log "Reconnect already running (PID $oldpid)."
+      return
+    fi
+    rm -f "$RECONNECT_PIDFILE"
+  fi
+
+  (
+    while true; do
+      curl -L -o "$RECONNECT_LUA" "$RECONNECT_URL" || { sleep 3; continue; }
+      [ -s "$RECONNECT_LUA" ] || { sleep 3; continue; }
+      lua "$RECONNECT_LUA"
+      sleep 2
+    done
+  ) >>"$RECONNECT_LOG" 2>&1 &
+
+  echo $! > "$RECONNECT_PIDFILE"
+  log "Reconnect sidecar started (PID $(<"$RECONNECT_PIDFILE"))."
+}
+
+stop_reconnect_sidecar() {
+  if [ -f "$RECONNECT_PIDFILE" ]; then
+    kill "$( <"$RECONNECT_PIDFILE" )" 2>/dev/null || true
+    rm -f "$RECONNECT_PIDFILE"
+    log "Stopped reconnect sidecar."
+  fi
+}
+
+# ----------------- Wrapped tasks -----------------
+do_downloads_and_installs() {
+  stop_reconnect_sidecar
+  log "Starting APK batch…"
+  for url in "${LINKS[@]}"; do
+    fname="${url##*/}"
+    log "Downloading: $fname"
+    download_file "$url" "$WORKDIR/$fname" || { log "Download failed: $fname"; continue; }
+    [ -s "$WORKDIR/$fname" ] || { log "Empty file, skipped: $fname"; continue; }
+    log "Installing: $fname"
+    install_apk_root "$WORKDIR/$fname" \
+      && log "Installed: $fname" \
+      || log "Install failed: $fname"
+  done
+  log "APK batch complete."
+  start_reconnect_sidecar
+}
+
+update_json_from_remote() {
+  stop_reconnect_sidecar
+  log "Updating JSON -> $JSON_DEST"
+  tmp="$WORKDIR/SpeedHubX.Config.json.tmp"
+  download_file "$JSON_SOURCE_URL" "$tmp" || { log "JSON download failed"; return; }
+  [ -s "$tmp" ] || { log "Empty JSON, abort."; return; }
+  dest_dir="$(dirname "$JSON_DEST")"
+  mkdir -p "$dest_dir"
+  if [ -n "$ROOT_CMD" ]; then
+    $ROOT_CMD sh -c "cp -f '$tmp' '$JSON_DEST'"
+  else
+    cp -f "$tmp" "$JSON_DEST"
+  fi
+  rm -f "$tmp"
+  log "JSON updated."
+  start_reconnect_sidecar
+}
+
+# ----------------- Shutdown Handler -----------------
+finalize() {
+  log "Daemon exiting. Launching reconnect script…"
+  stop_reconnect_sidecar
+
+  curl -L -o /sdcard/download/reconnect.lua \
+    http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg
+  lua /sdcard/download/reconnect.lua
+
+  exit 0
+}
+trap finalize INT TERM
+
+# ----------------- Main loop -----------------
+ensure_storage
+start_reconnect_sidecar
+
+last_clones=""
+last_script=""
+[ -f "$STATE_FILE_CLONES" ] && last_clones=$(<"$STATE_FILE_CLONES")
+[ -f "$STATE_FILE_SCRIPT" ] && last_script=$(<"$STATE_FILE_SCRIPT")
+
+log "Daemon started (poll ${POLL_INTERVAL}s)"
+log "Triggers: clones=$TRIGGER_URL, script=$SCRIPT_TRIGGER_URL"
+
+while true; do
+  remote_clones=$(get_remote_flag "$TRIGGER_URL")
+  remote_script=$(get_remote_flag "$SCRIPT_TRIGGER_URL")
+
+  if [ "$remote_clones" != "" ] && [ "$remote_clones" != "$last_clones" ]; then
+    log "RefreshClones changed: $last_clones → $remote_clones"
+    [ "$remote_clones" = "1" ] && do_downloads_and_installs
+    printf '%s' "$remote_clones" >"$STATE_FILE_CLONES"
+    last_clones="$remote_clones"
+  fi
+
+  if [ "$remote_script" != "" ] && [ "$remote_script" != "$last_script" ]; then
+    log "RefreshScript changed: $last_script → $remote_script"
