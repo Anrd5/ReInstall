@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# Termux Android Automation (Standalone)
+# - Continuous loop, boot-ready, and edge-triggered actions.
+# - Designed for Android 10 / VMOS Cloud Phone / Rooted with Magisk.
+# - Uses Termux private storage for APKs per your rules.
+
+# ---------------------------
+# Configuration
+# ---------------------------
+
+# APK URLs (add/remove as needed)
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# Triggers
+APK_TRIGGER_RAW_1="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt"
+APK_TRIGGER_RAW_2="https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/RefreshClones.txt"
+
+JSON_TRIGGER_RAW_1="https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/RefreshScript.txt"
+JSON_TRIGGER_RAW_2="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt"
+
+# JSON source and destination
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+DEST_JSON_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+DEST_JSON_FILE="$DEST_JSON_DIR/Grow a Garden.json"
+
+# Other script (foreground)
+RECONNECT_LUA_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+RECONNECT_LUA_PATH="/sdcard/download/reconnect.lua"
+
+# Intervals
+POLL_SECONDS=60
+NET_TIMEOUT=15
+RETRIES=3
+
+# Paths
+APKS_DIR="$HOME/apks"
+STATE_DIR="$HOME/.termux-ops"
+STATE_FILE="$STATE_DIR/state.env"
+LOG_FILE="$STATE_DIR/automation.log"
+BOOT_DIR="$HOME/.termux/boot"
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+log() {
+  mkdir -p "$STATE_DIR"
+  printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
+}
+
+trim_01() {
+  # usage: val=$(trim_01 "$raw")
+  # returns 0 or 1 if found, else empty
+  printf "%s" "$1" | tr -d '\r\n\t ' | sed -n 's/^\([01]\).*$/\1/p'
+}
+
+have_su() {
+  command -v su >/dev/null 2>&1
+}
+
+pm_install() {
+  local apk="$1"
+  if have_su; then
+    # Try standard, then with --user 0
+    if su -c "pm install -r \"$apk\"" >/dev/null 2>&1; then
+      return 0
+    fi
+    su -c "pm install -r --user 0 \"$apk\"" >/dev/null 2>&1
+    return $?
+  else
+    # Fallback (likely to fail without root/shell uid)
+    pm install -r "$apk" >/dev/null 2>&1
+    return $?
+  fi
+}
+
+curl_get() {
+  # curl with sane defaults
+  curl -fsSL --connect-timeout "$NET_TIMEOUT" --retry "$RETRIES" --retry-delay 2 "$@"
+}
+
+fetch_trigger() {
+  # Try both raw URLs; return first non-empty 0/1 value.
+  local v
+  v=$(curl_get "$1" | { read -r firstline || true; printf "%s" "$firstline"; } | trim_01)
+  if [ -n "$v" ]; then
+    printf "%s" "$v"
+    return 0
+  fi
+  v=$(curl_get "$2" | { read -r firstline || true; printf "%s" "$firstline"; } | trim_01)
+  if [ -n "$v" ]; then
+    printf "%s" "$v"
+    return 0
+  fi
+  printf ""
+  return 1
+}
+
+ensure_dirs() {
+  mkdir -p "$APKS_DIR" "$STATE_DIR"
+  # Create destination dir for JSON if possible
+  if [ ! -d "$DEST_JSON_DIR" ]; then
+    mkdir -p "$DEST_JSON_DIR" 2>/dev/null || true
+  fi
+}
+
+ensure_storage_permission() {
+  # Try to ensure Termux has access to /storage/emulated/0
+  if [ ! -d "/storage/emulated/0" ] || [ ! -w "/storage/emulated/0" ]; then
+    log "Requesting storage permission (termux-setup-storage)..."
+    yes | termux-setup-storage >/dev/null 2>&1 || true
+    sleep 2
+  fi
+}
+
+load_state() {
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$STATE_FILE"
+  fi
+  : "${FIRST_RUN:=1}"
+  : "${APK_LAST_SEEN:=0}"
+  : "${APK_CYCLE:=0}"
+  : "${JSON_LAST_SEEN:=0}"
+  : "${JSON_CYCLE:=0}"
+  : "${OTHER_LAST_APK_CYCLE:=0}"
+  : "${OTHER_LAST_JSON_CYCLE:=0}"
+}
+
+save_state() {
+  cat >"$STATE_FILE".tmp <<EOF
+FIRST_RUN=${FIRST_RUN}
+APK_LAST_SEEN=${APK_LAST_SEEN}
+APK_CYCLE=${APK_CYCLE}
+JSON_LAST_SEEN=${JSON_LAST_SEEN}
+JSON_CYCLE=${JSON_CYCLE}
+OTHER_LAST_APK_CYCLE=${OTHER_LAST_APK_CYCLE}
+OTHER_LAST_JSON_CYCLE=${OTHER_LAST_JSON_CYCLE}
+EOF
+  mv "$STATE_FILE".tmp "$STATE_FILE"
+}
+
+setup_boot_hook() {
+  if [ -d "$BOOT_DIR" ]; then
+    local wrapper="$BOOT_DIR/99-termux-automation.sh"
+    if [ ! -f "$wrapper" ]; then
+      cat >"$wrapper" <<'WRAP'
+#!/data/data/com.termux/files/usr/bin/sh
+# Boot wrapper for automation
+# Wait a bit for network/storage after boot
+sleep 15
+/data/data/com.termux/files/usr/bin/bash -lc "$HOME/termux_automation.sh"
+WRAP
+      chmod +x "$wrapper"
+      log "Created Termux:Boot launcher at $wrapper"
+    fi
+  fi
+}
+
+wait_for_network() {
+  # Try hitting one of the triggers with HEAD
+  local url="$APK_TRIGGER_RAW_1"
+  local i=0
+  while ! curl -fsI --connect-timeout "$NET_TIMEOUT" "$url" >/dev/null 2>&1; do
+    i=$((i+1))
+    [ $i -gt 10 ] && break
+    log "Waiting for network..."
+    sleep 5
+  done
+}
+
+download_apks() {
+  local ok=0
+  mkdir -p "$APKS_DIR"
+  for u in "${APK_URLS[@]}"; do
+    local fn="$APKS_DIR/$(basename "$u")"
+    log "Downloading APK: $(basename "$u")"
+    if curl_get -o "$fn" "$u"; then
+      ok=1
+    else
+      log "Failed to download: $u"
+    fi
+  done
+  [ $ok -eq 1 ]
+}
+
+install_apks_and_clean() {
+  local any_fail=0
+  shopt -s nullglob
+  for apk in "$APKS_DIR"/*.apk; do
+    log "Installing: $(basename "$apk")"
+    if pm_install "$apk"; then
+      log "Installed: $(basename "$apk"))"
+      rm -f "$apk"
+    else
+      log "Install failed: $(basename "$apk"))"
+      any_fail=1
+      # keep the file for retry next cycle
+    fi
+  done
+  shopt -u nullglob
+  if [ $any_fail -eq 0 ]; then
+    # clean any leftovers
+    rm -f "$APKS_DIR"/*.apk 2>/dev/null || true
+    return 0
+  else
+    return 1
+  fi
+}
+
+run_apk_cycle() {
+  log "APK cycle starting..."
+  if download_apks && install_apks_and_clean; then
+    log "APK cycle completed successfully."
+    return 0
+  else
+    log "APK cycle completed with errors; will retry next trigger."
+    return 1
+  fi
+}
+
+run_json_cycle() {
+  log "JSON cycle starting..."
+  ensure_storage_permission
+  local tmp_json="$STATE_DIR/tmp.json"
+  if curl_get -o "$tmp_json" "$JSON_URL"; then
+    # Replace contents atomically
+    mkdir -p "$DEST_JSON_DIR" || true
+    # Ensure destination file exists; then overwrite
+    if mv "$tmp_json" "$DEST_JSON_FILE"; then
+      log "Replaced contents of: $DEST_JSON_FILE"
+      return 0
+    else
+      log "Failed to move JSON into place. Check storage permissions."
+      rm -f "$tmp_json"
+      return 1
+    fi
+  else
+    log "Failed to download JSON from $JSON_URL"
+    return 1
+  fi
+}
+
+should_run_other() {
+  # Run only if both cycles have progressed beyond the last time OTHER ran
+  if [ "$APK_CYCLE" -gt "$OTHER_LAST_APK_CYCLE" ] && [ "$JSON_CYCLE" -gt "$OTHER_LAST_JSON_CYCLE" ]; then
+    return 0
+  fi
+  return 1
+}
+
+run_other_script() {
+  log "Running reconnect script in foreground..."
+  # Download Lua file
+  if curl_get -o "$RECONNECT_LUA_PATH" "$RECONNECT_LUA_URL"; then
+    if command -v lua >/dev/null 2>&1; then
+      lua "$RECONNECT_LUA_PATH"
+      local rc=$?
+      log "Reconnect script exited with code $rc"
+      return $rc
+    else
+      log "lua interpreter not found. Install with: pkg install lua"
+      return 1
+    fi
+  else
+    log "Failed to download reconnect.lua"
+    return 1
+  fi
+}
+
+initial_run() {
+  # First run: do APK + JSON once regardless of triggers, then OTHER once
+  log "First run: executing APK + JSON cycles unconditionally."
+  local apk_ok=1 json_ok=1
+  run_apk_cycle || apk_ok=0
+  run_json_cycle || json_ok=0
+  if [ $apk_ok -eq 1 ]; then APK_CYCLE=$((APK_CYCLE+1)); fi
+  if [ $json_ok -eq 1 ]; then JSON_CYCLE=$((JSON_CYCLE+1)); fi
+  save_state
+
+  if should_run_other; then
+    if run_other_script; then
+      OTHER_LAST_APK_CYCLE=$APK_CYCLE
+      OTHER_LAST_JSON_CYCLE=$JSON_CYCLE
+      log "First run: reconnect script completed."
+    else
+      log "First run: reconnect script failed (will try again after next cycles)."
+    fi
+  fi
+  FIRST_RUN=0
+  save_state
+}
+
+# ---------------------------
+# Main
+# ---------------------------
+
+ensure_dirs
+setup_boot_hook
+wait_for_network
+load_state
+
+# First run behavior
+if [ "$FIRST_RUN" -eq 1 ]; then
+  initial_run
+fi
+
+log "Entering continuous loop (poll every ${POLL_SECONDS}s)..."
+
+while :; do
+  wait_for_network
+
+  # Fetch triggers (empty if not reachable)
+  apk_trig=$(fetch_trigger "$APK_TRIGGER_RAW_1" "$APK_TRIGGER_RAW_2" || true)
+  json_trig=$(fetch_trigger "$JSON_TRIGGER_RAW_1" "$JSON_TRIGGER_RAW_2" || true)
+
+  # Normalize unset to last seen (no network/update)
+  if [ -z "$apk_trig" ]; then apk_trig="$APK_LAST_SEEN"; fi
+  if [ -z "$json_trig" ]; then json_trig="$JSON_LAST_SEEN"; fi
+
+  # Detect 0 -> 1 edges to run the cycles
+  if [ "$APK_LAST_SEEN" = "0" ] && [ "$apk_trig" = "1" ]; then
+    log "APK trigger edge 0->1 detected."
+    if run_apk_cycle; then
+      APK_CYCLE=$((APK_CYCLE+1))
+    fi
+  fi
+
+  if [ "$JSON_LAST_SEEN" = "0" ] && [ "$json_trig" = "1" ]; then
+    log "JSON trigger edge 0->1 detected."
+    if run_json_cycle; then
+      JSON_CYCLE=$((JSON_CYCLE+1))
+    fi
+  fi
+
+  # Update last seen
+  APK_LAST_SEEN="$apk_trig"
+  JSON_LAST_SEEN="$json_trig"
+  save_state
+
+  # Only run OTHER if both cycles have advanced since last OTHER run.
+  if should_run_other; then
+    # If a trigger is currently 1, we do not run OTHER yet—wait until user flips to 0 then 1 and both cycles complete again.
+    # This ensures OTHER is "disabled" when triggers are being (re)run.
+    if [ "$APK_LAST_SEEN" = "1" ] || [ "$JSON_LAST_SEEN" = "1" ]; then
+      log "Skipping reconnect (a trigger is 1). Will run after cycles complete."
+    else
+      if run_other_script; then
+        OTHER_LAST_APK_CYCLE=$APK_CYCLE
+        OTHER_LAST_JSON_CYCLE=$JSON_CYCLE
+        save_state
+      else
+        log "Reconnect script failed. It will be attempted again after next cycles."
+      fi
+    fi
+  fi
+
+  sleep "$POLL_SECONDS"
+done
