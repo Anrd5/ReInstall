@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# install_cryptics_daemon.sh — One-shot APK installer + JSON patcher + daemon with reconnect control
+
+set -u
+
+# ----------------- Configuration -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+
+TRIGGER_CLONES_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt"
+TRIGGER_SCRIPT_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt"
+
+STATE_CLONES="$WORKDIR/.last_refresh_clones"
+STATE_SCRIPT="$WORKDIR/.last_refresh_script"
+
+RECONNECT_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+RECONNECT_PATH="/sdcard/download/reconnect.lua"
+
+JSON_SRC="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+JSON_TARGET="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
+
+APK_LINKS=(
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+"https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# ----------------- Logging -----------------
+mkdir -p "$WORKDIR"
+log() { echo "[`date '+%Y-%m-%d %H:%M:%S'`] $*" ; }
+
+# ----------------- Root Command -----------------
+ROOT=""
+if command -v tsu >/dev/null 2>&1; then ROOT="tsu -c"
+elif command -v su >/dev/null 2>&1; then ROOT="su -c"
+else log "No root command (tsu/su) found."; exit 1; fi
+
+# ----------------- Downloader -----------------
+DL_TOOL=""
+if command -v wget >/dev/null 2>&1; then DL_TOOL="wget"
+elif command -v curl >/dev/null 2>&1; then DL_TOOL="curl"
+else log "Neither wget nor curl found."; exit 1; fi
+
+download() {
+  url="$1"; out="$2"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -q -c -O "$out" "$url" || curl -L -o "$out" "$url"
+  else
+    curl -L -o "$out" "$url" || wget -q -c -O "$out" "$url"
+  fi
+}
+
+# ----------------- Reconnect Control -----------------
+kill_reconnect() {
+  pkill -f "$RECONNECT_PATH" >/dev/null 2>&1 || true
+  sleep 1
+  pkill -9 -f "$RECONNECT_PATH" >/dev/null 2>&1 || true
+  log "Reconnect stopped."
+}
+
+run_reconnect_foreground() {
+  download "$RECONNECT_URL" "$RECONNECT_PATH"
+  chmod 644 "$RECONNECT_PATH"
+  if ! command -v lua >/dev/null 2>&1; then pkg install -y lua || true; fi
+  log "Launching reconnect..."
+  lua "$RECONNECT_PATH"
+}
+
+# ----------------- APK Install -----------------
+install_apk() {
+  apk="$1"
+  $ROOT "pm install -r -g '$apk'" || $ROOT "pm install -r '$apk'" || $ROOT "cmd package install -r -g '$apk'" || $ROOT "cmd package install -r '$apk'"
+}
+
+process_apks() {
+  log "Processing APKs..."
+  for link in "${APK_LINKS[@]}"; do
+    name="${link##*/}"
+    path="$WORKDIR/$name"
+    download "$link" "$path"
+    [ -s "$path" ] && install_apk "$path"
+    [ "$KEEP_APKS" = "0" ] && rm -f "$path"
+  done
+  log "APK installation completed."
+}
+
+# ----------------- JSON Replacement -----------------
+replace_json() {
+  tmp="$WORKDIR/tmp_config.json"
+  download "$JSON_SRC" "$tmp"
+  [ -s "$tmp" ] || { log "Downloaded JSON is empty"; return 1; }
+  mkdir -p "$(dirname "$JSON_TARGET")"
+  cp "$JSON_TARGET" "${JSON_TARGET}.bak" 2>/dev/null || true
+  mv "$tmp" "$JSON_TARGET"
+  log "JSON replaced at: $JSON_TARGET"
+}
+
+# ----------------- Trigger Check -----------------
+read_trigger() {
+  url="$1"
+  val="$($DL_TOOL -s "$url" | tr -d '\r\n ' | cut -c1)"
+  case "$val" in 0|1) echo "$val" ;; *) echo "" ;; esac
+}
+
+# ----------------- Main Loop -----------------
+last_clone=""; last_script=""
+[ -f "$STATE_CLONES" ] && last_clone="$(cat "$STATE_CLONES")"
+[ -f "$STATE_SCRIPT" ] && last_script="$(cat "$STATE_SCRIPT")"
+
+while true; do
+  clone_flag="$(read_trigger "$TRIGGER_CLONES_URL")"
+  script_flag="$(read_trigger "$TRIGGER_SCRIPT_URL")"
+
+  action=0
+  [ "$clone_flag" = "1" ] && [ "$last_clone" != "1" ] && action=1
+  [ "$script_flag" = "1" ] && [ "$last_script" != "1" ] && action=1
+
+  if [ "$action" = "1" ]; then
+    kill_reconnect
+    [ "$clone_flag" = "1" ] && process_apks && echo "1" > "$STATE_CLONES"
+    [ "$script_flag" = "1" ] && replace_json && echo "1" > "$STATE_SCRIPT"
+    run_reconnect_foreground
+    log "Restarted reconnect."
+  else
+    sleep "$POLL_INTERVAL"
+  fi
+done
