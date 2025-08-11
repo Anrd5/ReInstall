@@ -1,0 +1,292 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -Eeuo pipefail
+
+# =========================
+# Config
+# =========================
+POLL_SECONDS=30
+
+APK_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt"
+JSON_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt"
+
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+TARGET_JSON="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
+
+# Put your custom "OTHER" script here. Must be executable.
+POST_SCRIPT="$HOME/post_run.sh"
+
+# State + logs
+STATE_DIR="$HOME/.local/share/cryptic_autorun"
+LOG_FILE="$STATE_DIR/autorun.log"
+APK_STATE_FILE="$STATE_DIR/apk_state"
+JSON_STATE_FILE="$STATE_DIR/json_state"
+PID_FILE="$STATE_DIR/autorun.pid"
+
+# =========================
+# Helpers
+# =========================
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE"; }
+
+trim() { tr -d ' \t\r\n' < /dev/stdin; }
+
+curl_text() {
+  # $1=url
+  curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 "$1"
+}
+
+ensure_state() {
+  mkdir -p "$STATE_DIR" "$STATE_DIR/apks"
+  : > "$LOG_FILE"
+  : >> "$APK_STATE_FILE"
+  : >> "$JSON_STATE_FILE"
+}
+
+ensure_singleton() {
+  if [ -f "$PID_FILE" ]; then
+    if ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1; then
+      log "Another instance is running (PID $(cat "$PID_FILE")). Exiting."
+      exit 0
+    fi
+  fi
+  echo "$$" > "$PID_FILE"
+  trap 'rm -f "$PID_FILE"' EXIT
+}
+
+check_root() {
+  if ! command -v su >/dev/null 2>&1; then
+    log "ERROR: su not found. Root is required to install APKs silently."
+  fi
+}
+
+ensure_storage() {
+  # Try to access shared storage; if missing, attempt to set up.
+  if [ ! -d "/storage/emulated/0" ]; then
+    log "WARN: /storage/emulated/0 not found. Storage may not be mounted."
+  fi
+  if [ ! -d "/storage/emulated/0" ]; then
+    return
+  fi
+  # Make sure target dir exists
+  mkdir -p "$(dirname "$TARGET_JSON")"
+}
+
+read_trigger() {
+  # $1=url
+  local val
+  if ! val="$(curl_text "$1" 2>/dev/null | trim)"; then
+    echo "ERR"
+    return
+  fi
+  case "$val" in
+    0|1) echo "$val" ;;
+    *) echo "ERR" ;;
+  esac
+}
+
+get_state() {
+  # $1=apk|json
+  local file
+  file="$APK_STATE_FILE"
+  [ "$1" = "json" ] && file="$JSON_STATE_FILE"
+  if [ -s "$file" ]; then
+    cat "$file"
+  else
+    echo "0"  # default: not processed
+  fi
+}
+
+set_state() {
+  # $1=apk|json  $2=value
+  local file
+  file="$APK_STATE_FILE"
+  [ "$1" = "json" ] && file="$JSON_STATE_FILE"
+  echo -n "$2" > "$file"
+}
+
+install_apk() {
+  # $1=path
+  local apk="$1"
+  if [ ! -s "$apk" ]; then
+    log "ERROR: APK missing or empty: $apk"
+    return 1
+  fi
+  # Try several rooted pm install forms
+  if su -c "pm install -r --user 0 '$apk'" >/dev/null 2>&1; then
+    log "Installed: $(basename "$apk")"
+    return 0
+  fi
+  if su -c "pm install -r '$apk'" >/dev/null 2>&1; then
+    log "Installed (fallback): $(basename "$apk")"
+    return 0
+  fi
+  # Last chance: cmd package (still requires root)
+  if su -c "cmd package install -r '$apk'" >/dev/null 2>&1; then
+    log "Installed (cmd fallback): $(basename "$apk")"
+    return 0
+  fi
+  log "ERROR: Failed to install $(basename "$apk")."
+  return 1
+}
+
+run_apk_cycle() {
+  log "APK: Starting cycle (download + install)"
+  local dir="$STATE_DIR/apks"
+  rm -f "$dir"/*.apk || true
+
+  local i=0 ok=0 fail=0
+  for url in "${APK_URLS[@]}"; do
+    local out="$dir/$(printf "Cryptic.%d.apk" "$i")"
+    i=$((i+1))
+    if curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$out" "$url"; then
+      if install_apk "$out"; then
+        ok=$((ok+1))
+      else
+        fail=$((fail+1))
+      fi
+    else
+      log "ERROR: Download failed: $url"
+      fail=$((fail+1))
+    fi
+  done
+
+  log "APK: Completed. Success=$ok Fail=$fail"
+}
+
+run_json_cycle() {
+  log "JSON: Starting cycle (download + replace)"
+  local tmp="$STATE_DIR/Grow_a_Garden.tmp.json"
+  if ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp" "$JSON_URL"; then
+    log "ERROR: Failed to download JSON: $JSON_URL"
+    return 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    log "ERROR: Downloaded JSON is empty."
+    return 1
+  fi
+  # Atomic replace
+  mkdir -p "$(dirname "$TARGET_JSON")"
+  mv -f "$tmp" "$TARGET_JSON"
+  sync || true
+  log "JSON: Replaced $TARGET_JSON"
+}
+
+post_script_guard() {
+  # Kills given PID if any trigger flips to 1
+  # $1=child_pid
+  local child="$1"
+  while kill -0 "$child" >/dev/null 2>&1; do
+    sleep 3
+    local a="$(read_trigger "$APK_TRIGGER_URL")"
+    local j="$(read_trigger "$JSON_TRIGGER_URL")"
+    if [ "$a" = "1" ] || [ "$j" = "1" ]; then
+      log "POST: Trigger flipped to 1 during post-script. Stopping it."
+      kill "$child" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$child" >/dev/null 2>&1 || true
+      return
+    fi
+  done
+}
+
+maybe_run_post_script() {
+  # Only run if:
+  # - POST_SCRIPT exists and is executable
+  # - Both states are "1_processed"
+  # - Both triggers are not currently requesting a new run (i.e., not 1 unprocessed)
+  local a_state; a_state="$(get_state apk)"
+  local j_state; j_state="$(get_state json)"
+  if [ "$a_state" != "1_processed" ] || [ "$j_state" != "1_processed" ]; then
+    return
+  fi
+
+  [ -x "$POST_SCRIPT" ] || return
+
+  # Don't start if triggers are currently 1 (new run requested)
+  local a_trig; a_trig="$(read_trigger "$APK_TRIGGER_URL")"
+  local j_trig; j_trig="$(read_trigger "$JSON_TRIGGER_URL")"
+  if [ "$a_trig" = "1" ] || [ "$j_trig" = "1" ]; then
+    return
+  fi
+
+  log "POST: Running post script: $POST_SCRIPT"
+  # Run in foreground; guard watcher in background
+  bash -c "$POST_SCRIPT" &
+  local child="$!"
+  post_script_guard "$child" &
+  local guard_pid="$!"
+  wait "$child" || log "POST: Script exited with non-zero status."
+  # Ensure guard exits
+  kill "$guard_pid" >/dev/null 2>&1 || true
+  wait "$guard_pid" 2>/dev/null || true
+  log "POST: Done."
+}
+
+process_triggers_once() {
+  local a_trig j_trig a_state j_state
+
+  a_trig="$(read_trigger "$APK_TRIGGER_URL")"
+  j_trig="$(read_trigger "$JSON_TRIGGER_URL")"
+
+  if [ "$a_trig" = "ERR" ]; then log "APK: Trigger read error (network?)"; fi
+  if [ "$j_trig" = "ERR" ]; then log "JSON: Trigger read error (network?)"; fi
+
+  a_state="$(get_state apk)"
+  j_state="$(get_state json)"
+
+  # APK logic: run only on 0 -> 1. States:
+  # - "0" means ready; "1_processed" means already ran for current '1'.
+  if [ "$a_trig" = "1" ] && [ "$a_state" != "1_processed" ]; then
+    run_apk_cycle || log "APK: cycle returned errors."
+    set_state apk "1_processed"
+  fi
+  if [ "$a_trig" = "0" ] && [ "$a_state" != "0" ]; then
+    log "APK: Reset to 0 (armed for next run)."
+    set_state apk "0"
+  fi
+
+  # JSON logic: same
+  if [ "$j_trig" = "1" ] && [ "$j_state" != "1_processed" ]; then
+    run_json_cycle || log "JSON: cycle returned errors."
+    set_state json "1_processed"
+  fi
+  if [ "$j_trig" = "0" ] && [ "$j_state" != "0" ]; then
+    log "JSON: Reset to 0 (armed for next run)."
+    set_state json "0"
+  fi
+
+  # Only try post script if both processed
+  maybe_run_post_script
+}
+
+main() {
+  ensure_state
+  ensure_singleton
+  check_root
+  ensure_storage
+
+  log "=== Cryptic Auto-Runner started ==="
+  log "Polling every ${POLL_SECONDS}s"
+  log "APK trigger:  $APK_TRIGGER_URL"
+  log "JSON trigger: $JSON_TRIGGER_URL"
+  log "Target JSON:  $TARGET_JSON"
+  log "Post script:  $POST_SCRIPT"
+
+  while true; do
+    process_triggers_once
+    sleep "$POLL_SECONDS"
+  done
+}
+
+main "$@"
