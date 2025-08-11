@@ -1,0 +1,283 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -Eeuo pipefail
+
+# ============ CONFIG ============
+# APK URLs
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# Triggers (RAW)
+APK_TRIGGER_RAW="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshClones.txt"
+# If your JSON trigger RAW differs, update below:
+JSON_TRIGGER_RAW="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/RefreshScript.txt"
+
+# JSON file to download and where to place it
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+JSON_DEST_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+JSON_DEST_FILE="${JSON_DEST_DIR}/Grow a Garden.json"
+
+# OTHER script commands
+OTHER_FETCH="curl -L -o /sdcard/download/reconnect.lua http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+OTHER_RUN="lua /sdcard/download/reconnect.lua"
+
+# Poll interval (seconds)
+SLEEP_SECS=45
+
+# ============ PATHS ============
+APKS_DIR="${HOME}/apks"
+TMP_DIR="${HOME}/.cache/cryptic-orchestrator"
+STATE_DIR="${HOME}/.local/share/cryptic-orchestrator"
+LOG_FILE="${STATE_DIR}/log.txt"
+STATE_FILE="${STATE_DIR}/state.env"
+
+mkdir -p "${APKS_DIR}" "${TMP_DIR}" "${STATE_DIR}"
+
+# ============ LOGGING ============
+log() {
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "[$ts] $*" | tee -a "${LOG_FILE}"
+}
+
+# ============ STATE MGMT ============
+# Keys: last_apk_trigger_val, last_json_trigger_val (0/1)
+#       last_trigger_rise_ts, last_apk_run_ts, last_json_run_ts, last_other_run_ts (epoch seconds)
+ensure_state_defaults() {
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    cat > "${STATE_FILE}" <<EOF
+last_apk_trigger_val=0
+last_json_trigger_val=0
+last_trigger_rise_ts=0
+last_apk_run_ts=0
+last_json_run_ts=0
+last_other_run_ts=0
+EOF
+  fi
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}"
+}
+
+save_state() {
+  cat > "${STATE_FILE}.tmp" <<EOF
+last_apk_trigger_val=${last_apk_trigger_val}
+last_json_trigger_val=${last_json_trigger_val}
+last_trigger_rise_ts=${last_trigger_rise_ts}
+last_apk_run_ts=${last_apk_run_ts}
+last_json_run_ts=${last_json_run_ts}
+last_other_run_ts=${last_other_run_ts}
+EOF
+  mv -f "${STATE_FILE}.tmp" "${STATE_FILE}"
+}
+
+# ============ UTIL ============
+curl_get() {
+  # $1 url, write to stdout
+  curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 2 "$1"
+}
+
+curl_get_to() {
+  # $1 url, $2 file
+  curl -fL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 -o "$2" "$1"
+}
+
+read_remote_flag() {
+  # $1 raw url -> echoes 0 or 1 (first occurrence)
+  local raw content val
+  raw="$1"
+  if ! content="$(curl_get "${raw}" || true)"; then
+    echo "0"
+    return 0
+  fi
+  # Extract first '0' or '1'
+  val="$(printf '%s' "${content}" | tr -cd '01' | head -c 1 || true)"
+  if [[ "${val:-0}" == "1" ]]; then echo "1"; else echo "0"; fi
+}
+
+require_storage_permission_hint_once() {
+  if [[ ! -d "/storage/emulated/0" ]]; then
+    log "Warning: /storage/emulated/0 not present. Run: termux-setup-storage"
+  fi
+}
+
+ensure_json_dest_dir() {
+  if [[ ! -d "${JSON_DEST_DIR}" ]]; then
+    mkdir -p "${JSON_DEST_DIR}" || true
+  }
+}
+
+# ============ APK INSTALL ============
+try_install_apk() {
+  local apk="$1"
+  # Try multiple strategies, return 0 on success
+  if pm install -r --user 0 "${apk}"; then return 0; fi
+  if cmd package install -r "${apk}"; then return 0; fi
+  if command -v su >/dev/null 2>&1; then
+    if su -c "pm install -r --user 0 '${apk}'"; then return 0; fi
+    if su -c "cmd package install -r '${apk}'"; then return 0; fi
+  fi
+  return 1
+}
+
+run_apk_cycle() {
+  log "APK cycle: starting download + install for ${#APK_URLS[@]} APKs"
+  local ok_any=0
+  for url in "${APK_URLS[@]}"; do
+    local name file
+    name="$(basename "${url}")"
+    file="${APKS_DIR}/${name}"
+
+    log "Downloading ${name}"
+    if ! curl_get_to "${url}" "${file}"; then
+      log "ERROR: Failed to download ${url}"
+      continue
+    fi
+
+    log "Installing ${name}"
+    if try_install_apk "${file}"; then
+      log "Installed ${name} successfully; deleting local APK"
+      rm -f "${file}" || true
+      ok_any=1
+    else
+      log "ERROR: Installation failed for ${name}. Keeping file for inspection: ${file}"
+    fi
+  done
+
+  if [[ "${ok_any}" -eq 1 ]]; then
+    log "APK cycle complete."
+  else
+    log "APK cycle finished with no successful installs."
+  fi
+}
+
+# ============ JSON REPLACE ============
+run_json_cycle() {
+  ensure_json_dest_dir
+  local tmp="${TMP_DIR}/SpeedHubX.Config.json"
+  log "JSON cycle: downloading ${JSON_URL}"
+  if ! curl_get_to "${JSON_URL}" "${tmp}"; then
+    log "ERROR: Failed to download JSON from ${JSON_URL}"
+    return 1
+  fi
+
+  # Replace contents atomically
+  local dest_tmp="${JSON_DEST_FILE}.tmp"
+  cp -f "${tmp}" "${dest_tmp}"
+  mv -f "${dest_tmp}" "${JSON_DEST_FILE}"
+  log "JSON cycle: replaced contents of: ${JSON_DEST_FILE}"
+}
+
+# ============ OTHER SCRIPT ============
+ensure_lua() {
+  if command -v lua >/dev/null 2>&1; then return 0; fi
+  log "Lua not found; attempting to install via pkg..."
+  if command -v pkg >/dev/null 2>&1; then
+    if yes | pkg install lua >/dev/null 2>&1; then
+      log "Lua installed."
+      return 0
+    else
+      log "WARNING: Failed to install lua automatically. OTHER step may fail."
+      return 1
+    fi
+  else
+    log "WARNING: pkg not available; cannot auto-install lua."
+    return 1
+  fi
+}
+
+run_other_step() {
+  log "OTHER: fetching reconnect.lua"
+  if ! eval "${OTHER_FETCH}"; then
+    log "ERROR: OTHER fetch failed."
+    return 1
+  fi
+
+  ensure_lua || true
+
+  log "OTHER: running reconnect.lua (foreground)"
+  if ! eval "${OTHER_RUN}"; then
+    log "ERROR: OTHER run failed."
+    return 1
+  fi
+  log "OTHER: completed."
+}
+
+# ============ MAIN LOOP ============
+main_loop() {
+  require_storage_permission_hint_once
+  ensure_state_defaults
+
+  # prevent duplicate instances
+  local self_name="cryptic_orchestrator.sh"
+  local count
+  count="$(pgrep -fc "${self_name}" || echo 0)"
+  if [[ "${count}" -gt 2 ]]; then
+    log "Another instance detected (${count}); exiting."
+    exit 0
+  fi
+
+  log "Started Cryptic orchestrator loop."
+
+  while :; do
+    local now apk_flag json_flag
+    now="$(date +%s)"
+    apk_flag="$(read_remote_flag "${APK_TRIGGER_RAW}")"
+    json_flag="$(read_remote_flag "${JSON_TRIGGER_RAW}")"
+
+    # Rising edges update last_trigger_rise_ts
+    if [[ "${apk_flag}" == "1" && "${last_apk_trigger_val}" != "1" ]]; then
+      last_trigger_rise_ts="${now}"
+      log "APK trigger rose to 1 (cycle start @ ${last_trigger_rise_ts})"
+      last_apk_trigger_val=1
+      save_state
+    elif [[ "${apk_flag}" == "0" && "${last_apk_trigger_val}" != "0" ]]; then
+      last_apk_trigger_val=0
+      save_state
+    fi
+
+    if [[ "${json_flag}" == "1" && "${last_json_trigger_val}" != "1" ]]; then
+      last_trigger_rise_ts="${now}"
+      log "JSON trigger rose to 1 (cycle start @ ${last_trigger_rise_ts})"
+      last_json_trigger_val=1
+      save_state
+    elif [[ "${json_flag}" == "0" && "${last_json_trigger_val}" != "0" ]]; then
+      last_json_trigger_val=0
+      save_state
+    fi
+
+    # Run APK cycle if needed for current cycle
+    if [[ "${apk_flag}" == "1" && "${last_apk_run_ts}" -le "${last_trigger_rise_ts}" ]]; then
+      run_apk_cycle || true
+      last_apk_run_ts="$(date +%s)"
+      save_state
+    fi
+
+    # Run JSON cycle if needed for current cycle
+    if [[ "${json_flag}" == "1" && "${last_json_run_ts}" -le "${last_trigger_rise_ts}" ]]; then
+      run_json_cycle || true
+      last_json_run_ts="$(date +%s)"
+      save_state
+    fi
+
+    # OTHER runs only after both tasks completed for the current cycle,
+    # and only once per cycle; disabled again if either trigger rises later.
+    if [[ "${last_apk_run_ts}" -gt "${last_trigger_rise_ts}" && \
+          "${last_json_run_ts}" -gt "${last_trigger_rise_ts}" && \
+          "${last_other_run_ts}" -le "${last_trigger_rise_ts}" ]]; then
+      run_other_step || true
+      last_other_run_ts="$(date +%s)"
+      save_state
+    fi
+
+    sleep "${SLEEP_SECS}"
+  done
+}
+
+main_loop
