@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# install_cryptics_daemon.sh
+
+set -u
+
+# ----------------- Configuration -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+
+# Repo details for the workflow-based trigger file
+REPO_OWNER="${REPO_OWNER:-Anrd5}"
+REPO_NAME="${REPO_NAME:-MyAppCollection}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+
+# Raw URL to the trigger file written by GitHub Actions workflow
+TRIGGER_RAW_URL="${TRIGGER_RAW_URL:-https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/.github/trigger.flag}"
+
+STATE_FILE="${WORKDIR}/.last_trigger_marker"
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize           Run as background daemon
+  --pidfile <path>      Set PID file
+  --logfile <path>      Set log file
+  --test                Test install first APK
+  --help                Show help
+
+Env vars: WORKDIR, KEEP_APKS, POLL_INTERVAL, REPO_OWNER, REPO_NAME, REPO_BRANCH, TRIGGER_RAW_URL
+EOF
+}
+
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    --daemonize) DAEMONIZE=1 ;;
+    --pidfile) i=$((i+1)); PIDFILE="${!i:-}" ;;
+    --logfile) i=$((i+1)); LOGFILE="${!i:-}" ;;
+    --test) TEST_MODE=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+  i=$((i+1))
+done
+
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
+
+log() {
+  printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$*"
+}
+
+# ----------------- Daemonize -----------------
+if [ "$DAEMONIZE" = 1 ]; then
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "Daemon already running (PID $oldpid). Exiting."
+      exit 0
+    else
+      rm -f "$PIDFILE"
+    fi
+  fi
+  mkdir -p "$(dirname "$LOGFILE")"
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" > "$LOGFILE" 2>&1 &
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid) → $LOGFILE"
+  exit 0
+fi
+
+echo "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE"; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
+
+# ----------------- Downloader selection (no auto-install) -----------------
+DL_TOOL=""
+if command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+elif command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+else
+  log "No downloader found. Please install 'curl' or 'wget' and rerun."
+  exit 1
+fi
+log "Using downloader: $DL_TOOL"
+
+# ----------------- Root command (tsu/su) -----------------
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu -c"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  log "No root helper (tsu/su) found."
+  exit 1
+fi
+log "Using root command: ${ROOT_CMD}"
+
+# ----------------- Helpers -----------------
+download_file() {
+  local url="$1"
+  local out="$2"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -c -O "$out" "$url"
+  else
+    curl -L -C - -o "$out" "$url"
+  fi
+}
+
+install_apk_root() {
+  local apk_path="$1"
+  $ROOT_CMD "pm install -r -g '$apk_path'"
+}
+
+get_remote_marker() {
+  # Returns first non-empty line from the trigger file (trimmed), or empty if unreachable
+  local content=""
+  if [ "$DL_TOOL" = "wget" ]; then
+    content="$(wget -qO- "$TRIGGER_RAW_URL" 2>/dev/null || true)"
+  else
+    content="$(curl -fsSL "$TRIGGER_RAW_URL" 2>/dev/null || true)"
+  fi
+  # Use the very first line, trim whitespace
+  printf '%s' "$(printf '%s' "$content" | sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p}')"
+}
+
+do_downloads_and_installs() {
+  log "Launching downloads..."
+  for url in "${LINKS[@]}"; do
+    fname="${url##*/}"
+    [ -f "$fname" ] && [ ! -s "$fname" ] && rm -f "$fname"
+    log "Fetching: $fname"
+    if ! download_file "$url" "$fname"; then
+      log "Failed $fname. Skipping."
+      continue
+    fi
+    if [ ! -s "$fname" ]; then
+      log "Empty file. Skipping install."
+      continue
+    fi
+    size=$(stat -c%s "$fname" 2>/dev/null || ls -l "$fname" | awk '{print $5}')
+    log "Installing: $fname ($size bytes)"
+    if install_apk_root "$PWD/$fname"; then
+      log "Success: $fname"
+      if [ "$KEEP_APKS" = "0" ]; then
+        rm -f "$fname"
+      else
+        log "Keeping file."
+      fi
+    else
+      log "Failed install: $fname"
+    fi
+  done
+  log "Install phase complete."
+}
+
+# ----------------- Modes -----------------
+if [ "$TEST_MODE" = 1 ]; then
+  log "TEST MODE ACTIVE"
+  LINKS=("${LINKS[0]}")
+  do_downloads_and_installs
+  exit 0
+fi
+
+last_marker=""
+[ -f "$STATE_FILE" ] && last_marker="$(cat "$STATE_FILE")"
+
+log "Daemon polling every ${POLL_INTERVAL}s"
+while true; do
+  remote="$(get_remote_marker)"
+  if [ -z "$remote" ]; then
+    log "Trigger unreachable. Sleeping ${POLL_INTERVAL}s."
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
+
+  if [ "$remote" != "$last_marker" ]; then
+    log "Trigger change detected → '${last_marker}' → '${remote}'"
+    # Any change triggers a run; you can optionally gate on content (e.g., contains "action=install")
+    case "$remote" in
+      *"action="* )
+        action_val="$(printf '%s' "$remote" | sed -n 's/.*action=\([^[:space:]]*\).*/\1/p')"
+        if [ "${action_val:-install}" = "install" ]; then
+          do_downloads_and_installs
+        else
+          log "Action '${action_val}' does not require install. Skipping."
+        fi
+        ;;
+      * )
+        # No action key; treat any change as install trigger
+        do_downloads_and_installs
+        ;;
+    esac
+    printf '%s' "$remote" > "$STATE_FILE"
+    last_marker="$remote"
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
