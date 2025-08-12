@@ -1,12 +1,9 @@
-name: RefreshScript (JSON trigger)
+name: RefreshScript (JSON Trigger)
 
 on:
-  workflow_dispatch: {}
-  # schedule:
-  #   - cron: "15 */6 * * *"
-
-permissions:
-  contents: write
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"  # optional schedule
 
 jobs:
   trigger-json:
@@ -14,15 +11,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Prepare trigger
+
+      - name: Ensure triggers directory
+        run: mkdir -p .triggers
+
+      - name: Write JSON trigger (one line: RUN_ID)
         run: |
-          mkdir -p triggers
-          echo "$(date -u +%FT%TZ) RUN_ID=${GITHUB_RUN_ID}" > triggers/json.trigger
-      - name: Commit trigger
+          echo "${{ github.run_id }}" > .triggers/json.trigger
+          echo "time=${{ github.run_number }} @ ${{ github.run_id }} @ ${{ github.run_attempt }}" >> .triggers/json.meta
+
+      - name: Commit and push
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add triggers/json.trigger
-          git commit -m "JSON trigger ${GITHUB_RUN_ID}" || echo "No changes"
-      - name: Push
-        run: git push
+          git config user.name "actions-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .triggers/json.trigger .triggers/json.meta
+          git commit -m "JSON trigger: run_id ${{ github.run_id }}"
+          git push
