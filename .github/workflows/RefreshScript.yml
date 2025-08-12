@@ -1,27 +1,37 @@
 name: RefreshScript
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
-  trigger-json:
+  set-json-trigger:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Update JSON trigger
+        with:
+          fetch-depth: 0
+
+      - name: Bump JSON trigger flag
         run: |
+          set -euo pipefail
           mkdir -p triggers
           {
-            echo "type=json"
+            echo "json_trigger=1"
+            echo "repo=${GITHUB_REPOSITORY}"
             echo "run_id=${GITHUB_RUN_ID}"
             echo "run_number=${GITHUB_RUN_NUMBER}"
-            echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > triggers/json.trigger
+            date -u +"timestamp=%Y-%m-%dT%H:%M:%SZ"
+          } > triggers/json.flag
+
       - name: Commit and push
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add triggers/json.trigger
-          git commit -m "chore: JSON trigger $(date -u +%Y-%m-%dT%H:%M:%SZ) #${GITHUB_RUN_ID}" || echo "No changes to commit"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add triggers/json.flag
+          git commit -m "chore(trigger): JSON run ${GITHUB_RUN_ID}"
           git push
