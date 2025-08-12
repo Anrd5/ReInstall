@@ -1,1 +1,34 @@
+name: RefreshClones (APK trigger)
+
+on:
+  workflow_dispatch: {}
+  # Optional: run on a schedule too
+  # schedule:
+  #   - cron: "0 */6 * * *"  # every 6 hours
+
+permissions:
+  contents: write
+
+jobs:
+  trigger-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare trigger file
+        run: |
+          mkdir -p triggers
+          echo "$(date -u +%FT%TZ) RUN_ID=${GITHUB_RUN_ID}" > triggers/apk.trigger
+
+      - name: Commit trigger
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add triggers/apk.trigger
+          git commit -m "APK trigger ${GITHUB_RUN_ID}" || echo "No changes to commit"
+
+      - name: Push
+        run: |
+          git push
 
