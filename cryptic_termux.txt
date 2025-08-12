@@ -1,0 +1,348 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -Eeuo pipefail
+
+# =========================
+# Config
+# =========================
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+
+# Target file: /storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json
+TARGET_JSON_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+TARGET_JSON_FILE="${TARGET_JSON_DIR}/Grow a Garden.json"
+
+# Other related script
+LUA_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+LUA_PATH="/sdcard/download/reconnect.lua"  # Use exactly as requested (lowercase folder)
+
+# Trigger files that workflows will update
+APK_TRIGGER_RAW="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/triggers/apk.trigger"
+JSON_TRIGGER_RAW="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/triggers/json.trigger"
+
+# Poll interval (seconds)
+SLEEP_SECONDS=60
+
+# =========================
+# Paths
+# =========================
+STATE_DIR="${HOME}/.myapp_state"
+APK_STATE="${STATE_DIR}/last_apk_id"
+JSON_STATE="${STATE_DIR}/last_json_id"
+CYCLE_STATE="${STATE_DIR}/last_cycle_id"
+OTHER_EXECUTED_FLAG="${STATE_DIR}/other_executed"
+FIRST_RUN_FLAG="${STATE_DIR}/first_run_done"
+
+DOWNLOAD_DIR="${HOME}/apks"
+TMP_DIR="${HOME}/.myapp_tmp"
+
+# =========================
+# Helpers
+# =========================
+log() {
+  printf '[%(%F %T)T] %s\n' -1 "$*" >&2
+}
+
+fail() {
+  log "ERROR: $*"
+  exit 1
+}
+
+ensure_dir() {
+  mkdir -p "$1"
+}
+
+retry_curl() {
+  # retry with backoff: curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors
+  curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "$@"
+}
+
+get_trigger_id() {
+  # Reads a trigger file and extracts RUN_ID=...; if not present, uses checksum of content
+  local url="$1"
+  local content
+  set +e
+  content="$(retry_curl -H 'Cache-Control: no-cache' "$url" 2>/dev/null)"
+  local rc=$?
+  set -e
+  if [ $rc -ne 0 ] || [ -z "$content" ]; then
+    echo "unavailable"
+    return 0
+  fi
+  # Prefer RUN_ID=XXXX if present
+  local rid
+  rid="$(printf '%s\n' "$content" | sed -n 's/.*RUN_ID=\([^ ]*\).*/\1/p' | head -n1)"
+  if [ -n "$rid" ]; then
+    echo "$rid"
+  else
+    # Fallback to a stable digest of content
+    printf '%s' "$content" | sha256sum | awk '{print $1}'
+  fi
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_pkg() {
+  local pkg="$1"
+  if ! have_cmd "$pkg"; then
+    log "Installing dependency: $pkg"
+    yes | pkg install -y "$pkg" >/dev/null 2>&1 || fail "Failed to install $pkg"
+  fi
+}
+
+ensure_deps() {
+  ensure_pkg curl
+  ensure_pkg sha256sum || true  # part of coreutils; keep silent
+  have_cmd lua || { log "Installing Lua runtime"; yes | pkg install -y lua >/dev/null 2>&1 || fail "Failed to install lua"; }
+}
+
+termux_storage_ready() {
+  [ -d "/storage/emulated/0" ] && [ -r "/storage/emulated/0" ]
+}
+
+ensure_storage() {
+  if ! termux_storage_ready; then
+    log "Initializing Termux storage access (grant permission on device if prompted)"
+    termux-setup-storage || true
+    # Give it a moment and re-check
+    sleep 2
+    if ! termux_storage_ready; then
+      log "Storage not yet accessible; will retry later."
+    fi
+  fi
+}
+
+install_apk_via_pm() {
+  local apk="$1"
+  # Try privileged install paths in order
+  if have_cmd su; then
+    su -c "pm install -r --user 0 \"$apk\"" && return 0 || true
+    su -c "pm install -r \"$apk\"" && return 0 || true
+  fi
+  pm install -r "$apk"
+}
+
+download_and_install_apks() {
+  log "APK: starting download + install"
+  ensure_dir "$DOWNLOAD_DIR"
+  ensure_dir "$TMP_DIR"
+
+  local ok_count=0
+  local fail_count=0
+
+  for url in "${APK_URLS[@]}"; do
+    local name="${url##*/}"
+    local out="${DOWNLOAD_DIR}/${name}"
+    log "APK: downloading $name"
+    if retry_curl -L -o "$out" "$url"; then
+      log "APK: installing $name"
+      if install_apk_via_pm "$out"; then
+        ok_count=$((ok_count+1))
+        log "APK: installed $name; deleting local file"
+        rm -f -- "$out"
+      else
+        fail_count=$((fail_count+1))
+        log "APK: FAILED to install $name (kept file for inspection)"
+      fi
+    else
+      fail_count=$((fail_count+1))
+      log "APK: FAILED to download $name"
+    fi
+  done
+
+  # Safety: ensure no APKs remain (permanent delete for successful installs)
+  find "$DOWNLOAD_DIR" -type f -name '*.apk' -print -exec rm -f {} \; >/dev/null 2>&1 || true
+
+  log "APK: done (ok=$ok_count, failed=$fail_count)"
+}
+
+download_and_replace_json() {
+  log "JSON: starting download + replace"
+  ensure_storage
+  ensure_dir "$TARGET_JSON_DIR"
+  ensure_dir "$TMP_DIR"
+
+  local tmp_json="${TMP_DIR}/download.json"
+  retry_curl -L -o "$tmp_json" "$JSON_URL" || fail "JSON: download failed"
+
+  # Optional backup (timestamped)
+  if [ -f "$TARGET_JSON_FILE" ]; then
+    local ts
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -f -- "$TARGET_JSON_FILE" "${TARGET_JSON_FILE}.bak.${ts}" || true
+  fi
+
+  # Replace contents atomically
+  cp -f -- "$tmp_json" "$TARGET_JSON_FILE"
+  sync || true
+  log "JSON: replaced contents in: $TARGET_JSON_FILE"
+}
+
+run_other_in_foreground() {
+  log "OTHER: preparing Lua script"
+  ensure_storage
+  # Use exactly the requested path; create it if missing
+  ensure_dir "/sdcard/download"
+
+  retry_curl -L -o "$LUA_PATH" "$LUA_URL" || fail "OTHER: failed to download Lua script"
+  sync || true
+
+  log "OTHER: running foreground: lua $LUA_PATH"
+  # Foreground execution (no backgrounding)
+  lua "$LUA_PATH"
+  local rc=$?
+  log "OTHER: finished (exit=$rc)"
+  return $rc
+}
+
+update_state() {
+  local key="$1" value="$2"
+  case "$key" in
+    apk) echo -n "$value" > "$APK_STATE" ;;
+    json) echo -n "$value" > "$JSON_STATE" ;;
+    cycle) echo -n "$value" > "$CYCLE_STATE" ;;
+    other_executed) echo -n "$value" > "$OTHER_EXECUTED_FLAG" ;;
+  esac
+}
+
+read_state() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    cat "$f"
+  else
+    echo ""
+  fi
+}
+
+first_run_bootstrap() {
+  if [ ! -f "$FIRST_RUN_FLAG" ]; then
+    log "First run detected: executing APK + JSON + OTHER in sequence"
+
+    download_and_install_apks || true
+    # Save a synthetic id so "Other" won’t get re-blocked immediately
+    update_state apk "first-run"
+
+    download_and_replace_json || true
+    update_state json "first-run"
+
+    update_state cycle "first-run"
+    update_state other_executed "0"
+
+    # Run Other now that top features are done
+    run_other_in_foreground || true
+    update_state other_executed "1"
+
+    touch "$FIRST_RUN_FLAG"
+    log "First run sequence complete"
+  fi
+}
+
+install_boot_hook_if_present() {
+  local boot_dir="${HOME}/.termux/boot"
+  if [ -d "$boot_dir" ]; then
+    local hook="${boot_dir}/myapp_daemon_boot.sh"
+    if [ ! -f "$hook" ]; then
+      cat > "$hook" <<'HBOOT'
+#!/data/data/com.termux/files/usr/bin/bash
+# Launch the daemon on boot (if not already running)
+SCRIPT="$HOME/myapp_daemon.sh"
+LOGFILE="$HOME/.myapp_state/daemon.log"
+
+mkdir -p "$HOME/.myapp_state"
+
+# Avoid duplicates
+if pgrep -f "bash .*myapp_daemon.sh" >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Start detached; the daemon itself loops
+nohup bash "$SCRIPT" >> "$LOGFILE" 2>&1 &
+HBOOT
+      chmod +x "$hook"
+      log "Termux:Boot hook installed at $hook"
+    fi
+  fi
+}
+
+main_loop() {
+  ensure_deps
+  ensure_dir "$STATE_DIR"
+  ensure_dir "$TMP_DIR"
+  ensure_dir "$DOWNLOAD_DIR"
+  install_boot_hook_if_present
+
+  first_run_bootstrap
+
+  log "Daemon: entering watch loop (interval ${SLEEP_SECONDS}s)"
+  while true; do
+    # Fetch remote trigger IDs
+    local apk_id json_id
+    apk_id="$(get_trigger_id "$APK_TRIGGER_RAW")"
+    json_id="$(get_trigger_id "$JSON_TRIGGER_RAW")"
+
+    local last_apk last_json
+    last_apk="$(read_state "$APK_STATE")"
+    last_json="$(read_state "$JSON_STATE")"
+
+    # If remote is unavailable, keep previous IDs to avoid accidental runs
+    if [ "$apk_id" = "unavailable" ]; then apk_id="$last_apk"; fi
+    if [ "$json_id" = "unavailable" ]; then json_id="$last_json"; fi
+
+    # Process APK if new
+    if [ -n "$apk_id" ] && [ "$apk_id" != "$last_apk" ]; then
+      log "Trigger: APK changed ($last_apk -> $apk_id)"
+      download_and_install_apks || true
+      update_state apk "$apk_id"
+    fi
+
+    # Process JSON if new
+    if [ -n "$json_id" ] && [ "$json_id" != "$last_json" ]; then
+      log "Trigger: JSON changed ($last_json -> $json_id)"
+      download_and_replace_json || true
+      update_state json "$json_id"
+    fi
+
+    # Determine cycle (both tasks aligned on latest IDs)
+    local cycle_id="${apk_id}-${json_id}"
+    local last_cycle
+    last_cycle="$(read_state "$CYCLE_STATE")"
+    local other_exec
+    other_exec="$(read_state "$OTHER_EXECUTED_FLAG")"
+
+    if [ "$cycle_id" != "$last_cycle" ]; then
+      # New cycle detected: disable Other until both tasks have been handled for this cycle
+      update_state cycle "$cycle_id"
+      update_state other_executed "0"
+      other_exec="0"
+      log "Cycle: reset other_executed due to new triggers ($last_cycle -> $cycle_id)"
+    fi
+
+    # Run OTHER only when:
+    # - both APK and JSON are up-to-date for this cycle (i.e., last_* match current ids)
+    # - OTHER not yet executed within this cycle
+    last_apk="$(read_state "$APK_STATE")"
+    last_json="$(read_state "$JSON_STATE")"
+
+    if [ "$other_exec" != "1" ] && [ "$last_apk" = "$apk_id" ] && [ "$last_json" = "$json_id" ] && [ -n "$apk_id" ] && [ -n "$json_id" ]; then
+      log "OTHER: conditions satisfied; running now"
+      run_other_in_foreground || true
+      update_state other_executed "1"
+    fi
+
+    sleep "$SLEEP_SECONDS"
+  done
+}
+
+# Entrypoint
+main_loop
