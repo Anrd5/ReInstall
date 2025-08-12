@@ -1,0 +1,296 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -Eeuo pipefail
+
+# =========================
+# Config
+# =========================
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+
+# Target: /storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json
+TARGET_JSON_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+TARGET_JSON_FILE="${TARGET_JSON_DIR}/Grow a Garden.json"
+
+# Other related script (run only after trigger cycle completes)
+LUA_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+LUA_PATH="/sdcard/download/reconnect.lua"  # exact path requested
+
+# Remote triggers (workflows will update these files)
+APK_TRIGGER_RAW="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/triggers/apk.trigger"
+JSON_TRIGGER_RAW="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/triggers/json.trigger"
+
+# Poll interval (seconds)
+SLEEP_SECONDS=60
+
+# =========================
+# Paths and state
+# =========================
+STATE_DIR="${HOME}/.myapp_state"
+APK_STATE="${STATE_DIR}/last_apk_id"
+JSON_STATE="${STATE_DIR}/last_json_id"
+CYCLE_STATE="${STATE_DIR}/last_cycle_id"
+OTHER_EXECUTED_FLAG="${STATE_DIR}/other_executed"
+FIRST_RUN_FLAG="${STATE_DIR}/first_run_done"
+
+DOWNLOAD_DIR="${HOME}/apks"
+TMP_DIR="${HOME}/.myapp_tmp"
+
+# =========================
+# Helpers
+# =========================
+log() { printf '[%(%F %T)T] %s\n' -1 "$*" >&2; }
+
+fail() { log "ERROR: $*"; exit 1; }
+
+ensure_dir() { mkdir -p "$1"; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_pkg() {
+  local pkg="$1"
+  if ! have_cmd "$pkg"; then
+    yes | pkg install -y "$pkg" >/dev/null 2>&1 || fail "Failed to install $pkg"
+  fi
+}
+
+ensure_deps() {
+  ensure_pkg curl
+  ensure_pkg coreutils || true
+  have_cmd lua || { yes | pkg install -y lua >/dev/null 2>&1 || fail "Failed to install lua"; }
+}
+
+retry_curl() {
+  curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors "$@"
+}
+
+termux_storage_ready() { [ -d "/storage/emulated/0" ] && [ -r "/storage/emulated/0" ]; }
+
+ensure_storage() {
+  if ! termux_storage_ready; then
+    termux-setup-storage || true
+    sleep 2
+  fi
+}
+
+get_trigger_id() {
+  local url="$1"
+  local content
+  set +e
+  content="$(retry_curl -H 'Cache-Control: no-cache' "$url" 2>/dev/null)"
+  local rc=$?
+  set -e
+  if [ $rc -ne 0 ] || [ -z "$content" ]; then
+    echo "unavailable"
+    return 0
+  fi
+  local rid
+  rid="$(printf '%s\n' "$content" | sed -n 's/.*RUN_ID=\([^ ]*\).*/\1/p' | head -n1)"
+  if [ -n "$rid" ]; then
+    echo "$rid"
+  else
+    printf '%s' "$content" | sha256sum | awk '{print $1}'
+  fi
+}
+
+read_state() { [ -f "$1" ] && cat "$1" || echo ""; }
+
+write_state() {
+  local key="$1" value="$2"
+  case "$key" in
+    apk) echo -n "$value" > "$APK_STATE" ;;
+    json) echo -n "$value" > "$JSON_STATE" ;;
+    cycle) echo -n "$value" > "$CYCLE_STATE" ;;
+    other) echo -n "$value" > "$OTHER_EXECUTED_FLAG" ;;
+  esac
+}
+
+install_apk_via_pm() {
+  local apk="$1"
+  if have_cmd su; then
+    su -c "pm install -r --user 0 \"$apk\"" && return 0 || true
+    su -c "pm install -r \"$apk\"" && return 0 || true
+  fi
+  pm install -r "$apk"
+}
+
+download_and_install_apks() {
+  log "APK: start"
+  ensure_dir "$DOWNLOAD_DIR"
+  local ok=0 failc=0
+
+  for url in "${APK_URLS[@]}"; do
+    local name="${url##*/}" out="${DOWNLOAD_DIR}/${name}"
+    log "APK: downloading $name"
+    if retry_curl -L -o "$out" "$url"; then
+      log "APK: installing $name"
+      if install_apk_via_pm "$out"; then
+        ok=$((ok+1))
+        rm -f -- "$out"
+      else
+        failc=$((failc+1))
+        log "APK: install failed for $name (left file)"
+      fi
+    else
+      failc=$((failc+1))
+      log "APK: download failed for $name"
+    fi
+  done
+
+  find "$DOWNLOAD_DIR" -type f -name '*.apk' -exec rm -f {} \; >/dev/null 2>&1 || true
+  log "APK: done (ok=$ok, failed=$failc)"
+}
+
+download_and_replace_json() {
+  log "JSON: start"
+  ensure_storage
+  ensure_dir "$TARGET_JSON_DIR"
+  ensure_dir "$TMP_DIR"
+  local tmp="${TMP_DIR}/download.json"
+
+  retry_curl -L -o "$tmp" "$JSON_URL" || fail "JSON: download failed"
+
+  if [ -f "$TARGET_JSON_FILE" ]; then
+    cp -f -- "$TARGET_JSON_FILE" "${TARGET_JSON_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true
+  fi
+
+  cp -f -- "$tmp" "$TARGET_JSON_FILE"
+  sync || true
+  log "JSON: replaced -> $TARGET_JSON_FILE"
+}
+
+run_other_in_foreground() {
+  log "OTHER: preparing"
+  ensure_storage
+  ensure_dir "/sdcard/download"
+  retry_curl -L -o "$LUA_PATH" "$LUA_URL" || fail "OTHER: download failed"
+  sync || true
+
+  log "OTHER: running (foreground): lua $LUA_PATH"
+  lua "$LUA_PATH"
+  local rc=$?
+  log "OTHER: finished (exit=$rc)"
+  return $rc
+}
+
+install_boot_hook_if_present() {
+  local boot_dir="${HOME}/.termux/boot"
+  if [ -d "$boot_dir" ]; then
+    local hook="${boot_dir}/myapp_daemon_boot.sh"
+    if [ ! -f "$hook" ]; then
+      cat > "$hook" <<'HBOOT'
+#!/data/data/com.termux/files/usr/bin/bash
+SCRIPT="$HOME/myapp_daemon.sh"
+LOGFILE="$HOME/.myapp_state/daemon.log"
+mkdir -p "$HOME/.myapp_state"
+if pgrep -f "bash .*myapp_daemon.sh" >/dev/null 2>&1; then exit 0; fi
+nohup bash "$SCRIPT" >> "$LOGFILE" 2>&1 &
+HBOOT
+      chmod +x "$hook"
+      log "Boot hook installed at $hook"
+    fi
+  fi
+}
+
+first_run_setup() {
+  if [ ! -f "$FIRST_RUN_FLAG" ]; then
+    log "First run: running APK + JSON ONLY (reconnect tool disabled on first run)"
+    download_and_install_apks || true
+    download_and_replace_json || true
+
+    # Block OTHER until a trigger cycle happens
+    write_state apk "first-run"
+    write_state json "first-run"
+    write_state cycle "first-run"
+    write_state other "1"  # mark executed to prevent auto-run before triggers
+
+    touch "$FIRST_RUN_FLAG"
+    log "First run: complete"
+  fi
+}
+
+main_loop() {
+  ensure_deps
+  ensure_dir "$STATE_DIR"
+  ensure_dir "$TMP_DIR"
+  ensure_dir "$DOWNLOAD_DIR"
+  install_boot_hook_if_present
+
+  first_run_setup
+
+  log "Daemon: watching triggers every ${SLEEP_SECONDS}s"
+  while true; do
+    # Read current remote IDs
+    local apk_id json_id
+    apk_id="$(get_trigger_id "$APK_TRIGGER_RAW")"
+    json_id="$(get_trigger_id "$JSON_TRIGGER_RAW")"
+
+    local last_apk last_json last_cycle other_exec
+    last_apk="$(read_state "$APK_STATE")"
+    last_json="$(read_state "$JSON_STATE")"
+    last_cycle="$(read_state "$CYCLE_STATE")"
+    other_exec="$(read_state "$OTHER_EXECUTED_FLAG")"
+
+    # If remote unavailable, hold
+    [ "$apk_id" = "unavailable" ] && apk_id="$last_apk"
+    [ "$json_id" = "unavailable" ] && json_id="$last_json"
+
+    # React to APK trigger change
+    if [ -n "$apk_id" ] && [ "$apk_id" != "$last_apk" ]; then
+      log "Trigger: APK changed ($last_apk -> $apk_id)"
+      download_and_install_apks || true
+      write_state apk "$apk_id"
+    fi
+
+    # React to JSON trigger change
+    if [ -n "$json_id" ] && [ "$json_id" != "$last_json" ]; then
+      log "Trigger: JSON changed ($last_json -> $json_id)"
+      download_and_replace_json || true
+      write_state json "$json_id"
+    fi
+
+    # Form current cycle signature
+    local cycle_id="${apk_id}-${json_id}"
+    if [ "$cycle_id" != "$last_cycle" ]; then
+      write_state cycle "$cycle_id"
+      write_state other "0"   # disable OTHER until this cycle is satisfied
+      other_exec="0"
+      log "Cycle: new cycle -> $cycle_id (OTHER disabled until tasks done)"
+    fi
+
+    # After both tasks are at latest IDs for this cycle, allow OTHER
+    last_apk="$(read_state "$APK_STATE")"
+    last_json="$(read_state "$JSON_STATE")"
+
+    if [ "$other_exec" != "1" ] && [ -n "$apk_id" ] && [ -n "$json_id" ] && \
+       [ "$last_apk" = "$apk_id" ] && [ "$last_json" = "$json_id" ]; then
+      # Final pre-run check: ensure no new triggers just arrived
+      local check_apk check_json
+      check_apk="$(get_trigger_id "$APK_TRIGGER_RAW")"
+      check_json="$(get_trigger_id "$JSON_TRIGGER_RAW")"
+      [ "$check_apk" = "unavailable" ] && check_apk="$apk_id"
+      [ "$check_json" = "unavailable" ] && check_json="$json_id"
+
+      if [ "$check_apk" = "$apk_id" ] && [ "$check_json" = "$json_id" ]; then
+        log "OTHER: conditions satisfied; launching reconnect tool"
+        run_other_in_foreground || true
+        write_state other "1"
+      else
+        log "OTHER: skipped (trigger changed right before launch)"
+      fi
+    fi
+
+    sleep "$SLEEP_SECONDS"
+  done
+}
+
+main_loop
