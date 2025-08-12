@@ -1,0 +1,185 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# cryptic-manager.sh — Termux standalone orchestrator
+# Android 10 (VMOS Cloud, rooted via Magisk) compatible.
+
+set -Eeuo pipefail
+
+# ------------ Configuration ------------
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+JSON_TARGET_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+JSON_TARGET_FILE="${JSON_TARGET_DIR}/Grow a Garden.json"
+
+TRIGGER_APK_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/triggers/apk.trigger"
+TRIGGER_JSON_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/triggers/json.trigger"
+
+OTHER_LUA_PATH="/sdcard/Download/reconnect.lua"
+OTHER_FETCH_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+
+APK_DIR="$HOME/apks"
+STATE_DIR="$HOME/.cryptic-manager"
+LOG_FILE="$STATE_DIR/manager.log"
+LOCK_FILE="$STATE_DIR/run.lock"
+LAST_APK_TRIGGER="$STATE_DIR/last_apk.trigger"
+LAST_JSON_TRIGGER="$STATE_DIR/last_json.trigger"
+FIRST_RUN_FLAG="$STATE_DIR/.first_run"
+
+AFTER_COMPLETE_CMD=""
+POST_HOOK_DIR="$STATE_DIR/post.d"
+
+# ------------ Utilities ------------
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { printf "[%s] %s\n" "$(ts)" "$*" | tee -a "$LOG_FILE"; }
+
+require_pkgs() {
+  local need_update=0
+  has() { command -v "$1" >/dev/null 2>&1; }
+
+  for pkg in curl jq lua coreutils util-linux; do
+    if ! has "$(echo "$pkg" | sed 's/coreutils/sha256sum/;s/util-linux/flock/')" ; then
+      log "Installing package: $pkg"
+      pkg install -y "$pkg" >/dev/null 2>&1 || need_update=1
+    fi
+  done
+
+  [ "$need_update" -eq 1 ] && pkg update -y >/dev/null 2>&1 || true
+}
+
+wake_lock_acquire() { command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true; }
+wake_lock_release() { command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock || true; }
+
+ensure_storage() {
+  [ ! -d /storage/emulated/0 ] && termux-setup-storage >/dev/null 2>&1 && sleep 2 || true
+}
+
+root_pm_install() {
+  local apk_path="$1"
+  command -v su >/dev/null 2>&1 && su -c "pm install -r --user 0 \"$apk_path\"" >/dev/null || pm install -r "$apk_path" >/dev/null
+}
+
+download_file() {
+  local url="$1" out="$2"
+  mkdir -p "$(dirname "$out")"
+  curl -fL --retry 5 --retry-connrefused --retry-delay 2 --connect-timeout 15 -o "${out}.part" "$url"
+  mv -f "${out}.part" "$out"
+}
+
+fetch_trigger() {
+  local url="$1" state="$2" tmp="$(mktemp)" cur_sum last_sum=""
+  if curl -fsL --connect-timeout 10 "$url" -o "$tmp"; then
+    cur_sum="$(sha256sum "$tmp" | awk '{print $1}')"
+    [ -f "$state" ] && last_sum="$(cat "$state")"
+    if [ "$cur_sum" != "$last_sum" ] && [ -s "$tmp" ]; then
+      echo "$cur_sum" >"$state"
+      rm -f "$tmp"
+      echo "changed"
+      return 0
+    fi
+  fi
+  rm -f "$tmp"
+  echo "unchanged"
+  return 0
+}
+
+# ------------ Tasks ------------
+task_apks() {
+  log "APK task: START"
+  mkdir -p "$APK_DIR"
+  for url in "${APK_URLS[@]}"; do
+    local name="$(basename "$url")" out="$APK_DIR/$name"
+    log "Downloading: $name"
+    download_file "$url" "$out"
+  done
+
+  for apk in "$APK_DIR"/*.apk; do
+    [ -e "$apk" ] || continue
+    log "Installing: $(basename "$apk")"
+    root_pm_install "$apk" || { log "ERROR: Install failed for $apk"; rm -rf "$APK_DIR"; exit 1; }
+  done
+
+  rm -rf "$APK_DIR"
+  log "APK task: DONE"
+}
+
+task_json() {
+  log "JSON task: START"
+  ensure_storage
+  mkdir -p "$JSON_TARGET_DIR"
+  local tmp_json="$(mktemp)"
+  download_file "$JSON_URL" "$tmp_json"
+
+  jq -e . <"$tmp_json" >/dev/null 2>&1 || { log "ERROR: Invalid JSON"; rm -f "$tmp_json"; exit 1; }
+
+  local tmp_target="$(mktemp -p "$JSON_TARGET_DIR" "grow-XXXXXX.json")"
+  cat "$tmp_json" >"$tmp_target"
+  rm -f "$tmp_json"
+  mv -f "$tmp_target" "$JSON_TARGET_FILE"
+  chmod 0644 "$JSON_TARGET_FILE" 2>/dev/null || true
+  log "JSON replaced at: $JSON_TARGET_FILE"
+  log "JSON task: DONE"
+}
+
+task_other() {
+  log "OTHER task: START"
+  mkdir -p "$(dirname "$OTHER_LUA_PATH")"
+  curl -fL --retry 5 --retry-delay 2 -o "$OTHER_LUA_PATH" "$OTHER_FETCH_URL"
+  lua "$OTHER_LUA_PATH"
+  log "OTHER task: DONE"
+}
+
+handoff_after_complete() {
+  local apk_triggered="$1" json_triggered="$2"
+  if [ "$apk_triggered" = "yes" ] || [ "$json_triggered" = "yes" ]; then
+    log "Post-run handoff: skipped (top feature ran)."
+    return 0
+  fi
+
+  local cmd=""
+  [ -n "$AFTER_COMPLETE_CMD" ] && cmd="$AFTER_COMPLETE_CMD"
+  [ -z "$cmd" ] && [ -f "$OTHER_LUA_PATH" ] && cmd="lua \"$OTHER_LUA_PATH\""
+
+  if [ -z "$cmd" ] && [ -d "$POST_HOOK_DIR" ]; then
+    log "Post-run hooks: START"
+    for hook in "$POST_HOOK_DIR"/*; do
+      [ -x "$hook" ] && env -i PATH="$PATH" HOME="$HOME" SHELL="$SHELL" TERM="$TERM" "$hook" || log "WARNING: hook failed: $hook"
+    done
+    log "Post-run hooks: DONE"
+    return 0
+  fi
+
+  [ -z "$cmd" ] && return 0
+
+  log "Post-run handoff: releasing resources and exec'ing external command"
+  wake_lock_release || true
+  trap - ERR EXIT
+  exec 9>&- && rm -f "$LOCK_FILE" 2>/dev/null || true
+  exec bash -lc "$cmd"
+}
+
+# ------------ Main ------------
+main() {
+  mkdir -p "$STATE_DIR" "$POST_HOOK_DIR"
+  : >"$LOG_FILE"
+  require_pkgs
+
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || { log "Another instance is running. Exiting."; exit 0; }
+
+  trap 'log "ABORTED (line $LINENO)"; wake_lock_release' ERR
+  trap 'wake_lock_release' EXIT
+  wake_lock_acquire
+
+  local apk_triggered="no" json_triggered="no"
+  [ ! -f "$FIRST_RUN_FLAG" ] && { : >"$FIRST_RUN_FLAG"; apk_triggered="yes"; json_triggered="yes"; log "First run detected."; }
+  [ "$(fetch_trigger "$TRIGGER_APK_URL" "$LAST_APK_TRIGGER")" = "changed" ] && apk_triggered="yes" && log "APK trigger detected."
+  [ "$(fetch_trigger "$TRIGGER_JSON
