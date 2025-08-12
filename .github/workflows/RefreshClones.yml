@@ -1,37 +1,28 @@
-name: RefreshClones
-
+name: Refresh APK installs
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/RefreshClones.yml"
 
 permissions:
   contents: write
 
 jobs:
-  set-apk-trigger:
+  stamp-apk-trigger:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Bump APK trigger flag
+      - name: Prepare trigger directory
+        run: mkdir -p triggers
+      - name: Stamp trigger with run info
         run: |
-          set -euo pipefail
-          mkdir -p triggers
-          {
-            echo "apk_trigger=1"
-            echo "repo=${GITHUB_REPOSITORY}"
-            echo "run_id=${GITHUB_RUN_ID}"
-            echo "run_number=${GITHUB_RUN_NUMBER}"
-            date -u +"timestamp=%Y-%m-%dT%H:%M:%SZ"
-          } > triggers/apk.flag
-
-      - name: Commit and push
+          echo "apk-run=$(date -Iseconds)-${{ github.run_id }}-${{ github.run_number }}-${{ github.sha }}" > triggers/apk.trigger
+      - name: Commit and push trigger
         run: |
-          set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add triggers/apk.flag
-          git commit -m "chore(trigger): APK run ${GITHUB_RUN_ID}"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add triggers/apk.trigger
+          git commit -m "APK trigger: run ${{ github.run_number }} (${{ github.run_id }})"
           git push
