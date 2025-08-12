@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# cryptic_reconnect_daemon.sh
+# Combines the "cryptic_termux" daemon (triggered APK installs) with downloading and running reconnect.lua.
+# Designed for Termux/Android. Safe to run foreground or with --daemonize.
+
+set -u  # undefined vars are errors
+
+########################################
+# Configuration (env vars can override)
+########################################
+
+# Work and logging
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+PIDFILE_DEFAULT="${PIDFILE_DEFAULT:-$WORKDIR/cryptic_daemon.pid}"
+LOGFILE_DEFAULT="${LOGFILE_DEFAULT:-$HOME/cryptic_daemon.log}"
+
+# Trigger polling
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
+STATE_FILE="${STATE_FILE:-$WORKDIR/.last_refresh_state}"
+
+# APK links to process when trigger=1
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# APK retention: 0 = delete after install, 1 = keep
+KEEP_APKS="${KEEP_APKS:-0}"
+
+# Reconnect.lua bits (download to /sdcard/download, then run exactly with lua)
+RECONNECT_URL="${RECONNECT_URL:-http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT37PvJvFqYuVwX321098d1fgg}"
+RECONNECT_DIR="${RECONNECT_DIR:-/sdcard/download}"
+RECONNECT_FILE="${RECONNECT_FILE:-$RECONNECT_DIR/reconnect.lua}"
+# Optional: set LUA_BIN explicitly (e.g., export LUA_BIN=lua5.3). Otherwise auto-detect.
+LUA_BIN="${LUA_BIN:-}"
+
+# Daemon flags (CLI can override)
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+
+########################################
+# Usage
+########################################
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize           Run as background daemon (nohup)
+  --pidfile <path>      PID file path (default: $PIDFILE_DEFAULT)
+  --logfile <path>      Log file path (default: $LOGFILE_DEFAULT)
+  --test                Test mode: process only first APK once, then run reconnect.lua once and exit
+  --help, -h            Show this help
+
+Config via environment:
+  WORKDIR, KEEP_APKS, POLL_INTERVAL, TRIGGER_URL, LUA_BIN,
+  RECONNECT_URL, RECONNECT_DIR, RECONNECT_FILE
+EOF
+}
+
+########################################
+# Parse CLI
+########################################
+
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  case "$arg" in
+    --daemonize) DAEMONIZE=1 ;;
+    --pidfile)   i=$((i+1)); PIDFILE="${!i:-}" ;;
+    --logfile)   i=$((i+1)); LOGFILE="${!i:-}" ;;
+    --test)      TEST_MODE=1 ;;
+    --help|-h)   usage; exit 0 ;;
+    *) echo "Unknown option: $arg"; usage; exit 1 ;;
+  esac
+  i=$((i+1))
+done
+
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+########################################
+# Helpers
+########################################
+
+log() { printf '[%s] %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$*"; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_termux_storage() {
+  if have_cmd termux-setup-storage; then
+    termux-setup-storage >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$RECONNECT_DIR" "/sdcard/Download" "$WORKDIR"
+}
+
+ensure_tools() {
+  # Downloader choice
+  if have_cmd wget; then DL_TOOL="wget"
+  elif have_cmd curl; then DL_TOOL="curl"
+  else
+    log "Installing wget..."
+    yes 2>/dev/null | pkg update -y >/dev/null 2>&1 || true
+    yes 2>/dev/null | pkg install -y wget >/dev/null 2>&1 || true
+    if have_cmd wget; then DL_TOOL="wget"
+    elif have_cmd curl; then DL_TOOL="curl"
+    else log "No downloader available."; exit 1; fi
+  fi
+  log "Using downloader: $DL_TOOL"
+
+  # Ensure curl and lua for reconnect.lua exact flow
+  if ! have_cmd curl; then
+    log "Installing curl..."
+    yes 2>/dev/null | pkg install -y curl >/dev/null 2>&1 || true
+  fi
+  if [ -z "$LUA_BIN" ]; then
+    for c in lua lua5.4 lua5.3 luajit; do
+      if have_cmd "$c"; then LUA_BIN="$c"; break; fi
+    done
+    if [ -z "$LUA_BIN" ]; then
+      log "Installing lua..."
+      yes 2>/dev/null | pkg install -y lua >/dev/null 2>&1 || true
+      if have_cmd lua; then LUA_BIN="lua"; fi
+    fi
+  fi
+  if [ -z "$LUA_BIN" ]; then
+    log "Lua interpreter not found after install attempt."; exit 127
+  fi
+  log "Using Lua interpreter: $LUA_BIN"
+}
+
+detect_root_cmd() {
+  ROOT_CMD=""
+  if have_cmd tsu; then ROOT_CMD="tsu -c"
+  elif have_cmd su; then ROOT_CMD="su -c"
+  fi
+  if [ -n "$ROOT_CMD" ]; then
+    log "Using root command: ${ROOT_CMD}"
+  else
+    log "No root helper (tsu/su) found. APK installs will be skipped."
+  fi
+}
+
+download_file() {
+  # download_file <url> <out>
+  local url="$1" out="$2"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -c -O "$out" "$url"
+  else
+    curl -L -C - -o "$out" "$url"
+  fi
+}
+
+install_apk_root() {
+  # install_apk_root <apk_path>
+  local apk_path="$1"
+  if [ -z "$ROOT_CMD" ]; then
+    log "Skipping install (no root): $apk_path"
+    return 2
+  fi
+  $ROOT_CMD "pm install -r -g '$apk_path'"
+}
+
+get_remote_flag() {
+  # returns 0|1 or empty string if unreachable/invalid
+  local content=""
+  if [ "$DL_TOOL" = "wget" ]; then
+    content="$(wget -qO- "$TRIGGER_URL" 2>/dev/null || true)"
+  else
+    content="$(curl -fsSL "$TRIGGER_URL" 2>/dev/null || true)"
+  fi
+  content="$(printf '%s' "$content" | tr -d '[:space:]' | cut -c1)"
+  case "$content" in
+    0|1) printf '%s' "$content" ;;
+    *)   printf '' ;;
+  esac
+}
+
+do_downloads_and_installs() {
+  log "Launching APK downloads..."
+  for url in "${LINKS[@]}"; do
+    fname="${url##*/}"
+    [ -f "$fname" ] && [ ! -s "$fname" ] && rm -f "$fname"
+    log "Fetching: $fname"
+    if ! download_file "$url" "$fname"; then
+      log "Failed $fname. Skipping."
+      continue
+    fi
+    if [ ! -s "$fname" ]; then
+      log "Empty file. Skipping install."
+      continue
+    fi
+    size="$( (stat -c%s "$fname" 2>/dev/null) || (ls -l "$fname" | awk '{print $5}') )"
+    log "Installing: $fname ($size bytes)"
+    if install_apk_root "$PWD/$fname"; then
+      log "Success: $fname"
+      if [ "$KEEP_APKS" = "0" ]; then rm -f "$fname"; else log "Keeping file."; fi
+    else
+      log "Failed install: $fname"
+    fi
+  done
+  log "Install phase complete."
+}
+
+download_and_run_reconnect() {
+  # EXACT sequence: curl -L -o /sdcard/download/reconnect.lua <URL> ; lua /sdcard/download/reconnect.lua
+  log "Preparing reconnect.lua at $RECONNECT_FILE"
+  mkdir -p "$RECONNECT_DIR"
+  if ! curl -L -o "$RECONNECT_FILE" "$RECONNECT_URL"; then
+    log "Failed to download reconnect.lua"
+    return 1
+  fi
+  log "Running reconnect.lua with $LUA_BIN"
+  "$LUA_BIN" "$RECONNECT_FILE"
+  rc=$?
+  log "reconnect.lua exit code: $rc"
+  return "$rc"
+}
+
+########################################
+# Daemonize if requested
+########################################
+
+mkdir -p "$WORKDIR"
+cd "$WORKDIR" || { echo "ERROR: cannot cd to $WORKDIR"; exit 1; }
+
+if [ "$DAEMONIZE" = 1 ]; then
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "Daemon already running (PID $oldpid). Exiting."
+      exit 0
+    else
+      rm -f "$PIDFILE"
+    fi
+  fi
+  mkdir -p "$(dirname "$LOGFILE")"
+  nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" ${TEST_MODE:+--test} >"$LOGFILE" 2>&1 &
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid) → $LOGFILE"
+  exit 0
+fi
+
+echo "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE"; log "Exiting"; exit 0' SIGINT SIGTERM EXIT
+
+########################################
+# Preflight
+########################################
+
+ensure_termux_storage
+ensure_tools
+detect_root_cmd
+
+# If test mode, do first APK only and run reconnect once
+if [ "$TEST_MODE" = 1 ]; then
+  log "TEST MODE ACTIVE"
+  LINKS=("${LINKS[0]}")
+  do_downloads_and_installs
+  download_and_run_reconnect
+  exit 0
+fi
+
+last_state=""
+[ -f "$STATE_FILE" ] && last_state="$(cat "$STATE_FILE" 2>/dev/null || true)"
+
+log "Daemon polling every ${POLL_INTERVAL}s"
+while true; do
+  remote="$(get_remote_flag)"
+  if [ -z "$remote" ]; then
+    log "Trigger unreachable. Sleeping ${POLL_INTERVAL}s."
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
+
+  if [ "$remote" != "$last_state" ]; then
+    log "Trigger change detected → '$last_state' → '$remote'"
+    if [ "$remote" = "1" ]; then
+      do_downloads_and_installs
+      # Always refresh and run reconnect.lua when trigger fires
+      download_and_run_reconnect
+    else
+      log "Trigger is idle (0)"
+    fi
+    echo "$remote" > "$STATE_FILE"
+    last_state="$remote"
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
