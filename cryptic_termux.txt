@@ -1,0 +1,368 @@
+#!/system/bin/sh
+# Standalone installer/daemon for Cryptic 0–7 on Termux (VMOS Cloud Android 10, rooted via Magisk)
+# Works with plain /system/bin/sh (POSIX). No external includes. All logic in this file.
+
+# ---------------------- Strict mode & environment ----------------------
+# POSIX-safe strict mode
+set -eu
+
+# Ensure Termux paths are on PATH if running inside Termux
+TERMUX_PREFIX="/data/data/com.termux/files/usr"
+if [ -d "$TERMUX_PREFIX/bin" ]; then
+  case ":$PATH:" in
+    *":$TERMUX_PREFIX/bin:"*) : ;;
+    *) PATH="$TERMUX_PREFIX/bin:$PATH" ;;
+  esac
+fi
+
+# Fallback HOME if not set (Termux) or unusable
+if [ "${HOME:-}" = "" ] || [ ! -d "$HOME" ]; then
+  if [ -d "$TERMUX_PREFIX/.." ]; then
+    HOME="$TERMUX_PREFIX/.."/home
+  else
+    HOME="/sdcard"
+  fi
+fi
+
+# ---------------------- Configuration (override via env) ----------------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"             # 0 = delete APKs after successful install, 1 = keep
+POLL_INTERVAL="${POLL_INTERVAL:-30}"    # seconds between trigger checks
+TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
+
+STATE_FILE="$WORKDIR/.last_refresh_state"
+PIDFILE_DEFAULT="$WORKDIR/cryptic_daemon.pid"
+LOGFILE_DEFAULT="$HOME/cryptic_daemon.log"
+
+# Install behavior
+FORCE_USER0="${FORCE_USER0:-1}"         # 1 = install for --user 0
+ALLOW_DOWNGRADE="${ALLOW_DOWNGRADE:-1}" # 1 = allow version downgrade
+
+# APK links (Cryptic 0–7)
+LINKS="
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk
+https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk
+"
+
+# Runtime flags (CLI can override behavior)
+DAEMONIZE=0
+TEST_MODE=0
+ONCE_MODE=0
+PIDFILE=""
+LOGFILE=""
+
+# ---------------------- Helpers ----------------------
+log() {
+  # Timestamped log to stdout and optional logfile
+  TS="$(date +%Y-%m-%dT%H:%M:%S)"
+  MSG="[$TS] $*"
+  printf "%s\n" "$MSG"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+ensure_dirs() {
+  mkdir -p "$WORKDIR" || die "cannot create $WORKDIR"
+  : "${PIDFILE:=$PIDFILE_DEFAULT}"
+  : "${LOGFILE:=$LOGFILE_DEFAULT}"
+  mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOGFILE")"
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+q() {
+  # Single-quote shell escaping: outputs a safely-quoted version of $1
+  # Example: abc'def -> 'abc'"'"'def'
+  s=$1
+  printf "'%s'" "$(printf "%s" "$s" | sed "s/'/'\"'\"'/g")"
+}
+
+file_size_bytes() {
+  # Portable file size
+  if [ -f "$1" ]; then
+    wc -c < "$1" 2>/dev/null | awk '{print $1}'
+  else
+    printf "0"
+  fi
+}
+
+# ---------------------- CLI parsing ----------------------
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize           Run as background daemon (poll TRIGGER_URL)
+  --once                Download & install now, then exit (no polling)
+  --pidfile <path>      Set PID file (default: $PIDFILE_DEFAULT)
+  --logfile <path>      Set log file (default: $LOGFILE_DEFAULT)
+  --test                Test mode: only install the first APK
+  --help, -h            Show this help
+
+Environment variables:
+  WORKDIR, KEEP_APKS, POLL_INTERVAL, TRIGGER_URL, FORCE_USER0, ALLOW_DOWNGRADE
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --daemonize) DAEMONIZE=1; shift ;;
+    --once) ONCE_MODE=1; shift ;;
+    --pidfile) shift; [ $# -gt 0 ] || die "missing value for --pidfile"; PIDFILE="$1"; shift ;;
+    --logfile) shift; [ $# -gt 0 ] || die "missing value for --logfile"; LOGFILE="$1"; shift ;;
+    --test) TEST_MODE=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+ensure_dirs
+cd "$WORKDIR" || die "cannot cd to $WORKDIR"
+
+# ---------------------- Downloader selection ----------------------
+DL_TOOL=""
+if have_cmd curl; then
+  DL_TOOL="curl"
+elif have_cmd wget; then
+  DL_TOOL="wget"
+else
+  # Try to install curl via Termux pkg if available
+  if have_cmd pkg; then
+    log "Installing curl via pkg..."
+    pkg update -y >/dev/null 2>&1 || true
+    pkg install -y curl >/dev/null 2>&1 || true
+    if have_cmd curl; then DL_TOOL="curl"; fi
+  fi
+  if [ -z "$DL_TOOL" ] && have_cmd wget; then
+    DL_TOOL="wget"
+  fi
+  [ -n "$DL_TOOL" ] || die "No downloader available (curl/wget)."
+fi
+log "Using downloader: $DL_TOOL"
+
+download_file() {
+  url="$1"
+  out="$2"
+  if [ "$DL_TOOL" = "curl" ]; then
+    # -f fail on HTTP errors, -L follow redirects, -C - resume, retries
+    if ! curl -fL --retry 3 --retry-delay 2 -C - -o "$out" "$url"; then
+      return 1
+    fi
+  else
+    # wget: -c resume, -O output
+    if ! wget -c -O "$out" "$url"; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# ---------------------- Root helpers ----------------------
+ROOT_CMD=""
+if have_cmd tsu; then
+  ROOT_CMD="tsu -c"
+elif have_cmd su; then
+  ROOT_CMD="su -c"
+else
+  die "No root helper found (tsu/su)."
+fi
+log "Using root command: $ROOT_CMD"
+
+run_root_script() {
+  # Write a temp script and run it via root to avoid quoting pitfalls
+  _script="$WORKDIR/.root_cmd.$$.$RANDOM.sh"
+  printf "%s\n" "$1" >"$_script" || return 1
+  chmod 700 "$_script" || true
+  sh_cmd="sh $(q "$_script")"
+  # shellcheck disable=SC2086
+  sh -c "$ROOT_CMD $sh_cmd"
+  rc=$?
+  rm -f "$_script" || true
+  return $rc
+}
+
+pm_install_root() {
+  apk="$1"
+  # Flags for cmd package and pm
+  flags_cmd=""
+  flags_pm=""
+  if [ "$ALLOW_DOWNGRADE" = "1" ]; then
+    flags_cmd="$flags_cmd -d"
+    flags_pm="$flags_pm -d"
+  fi
+  flags_cmd="$flags_cmd -R -g"
+  flags_pm="$flags_pm -r -g"
+  if [ "$FORCE_USER0" = "1" ]; then
+    flags_cmd="$flags_cmd --user 0"
+    flags_pm="$flags_pm --user 0"
+  fi
+  qapk=$(q "$apk")
+
+  root_script=""
+  root_script="$root_script"'
+set -eu
+ok=1
+if command -v cmd >/dev/null 2>&1; then
+  if cmd package install '"$flags_cmd"' -i com.android.shell '"$qapk"'; then
+    ok=0
+  fi
+fi
+if [ "$ok" -ne 0 ] && command -v pm >/dev/null 2>&1; then
+  if pm install '"$flags_pm"' '"$qapk"'; then
+    ok=0
+  fi
+fi
+exit "$ok"
+'
+  run_root_script "$root_script"
+  return $?
+}
+
+# ---------------------- Trigger fetch ----------------------
+get_remote_flag() {
+  content=""
+  if [ "$DL_TOOL" = "curl" ]; then
+    content="$(curl -fsSL "$TRIGGER_URL" 2>/dev/null || true)"
+  else
+    content="$(wget -qO- "$TRIGGER_URL" 2>/dev/null || true)"
+  fi
+  # Strip whitespace, take first char
+  content="$(printf "%s" "$content" | tr -d '[:space:]' | cut -c1 || true)"
+  case "$content" in
+    0|1) printf "%s" "$content" ;;
+    *) printf "" ;;
+  caseesac 2>/dev/null || true
+}
+
+# ---------------------- Core work ----------------------
+do_downloads_and_installs() {
+  log "Starting downloads and installs..."
+  # Optionally limit to first link in test mode
+  LINKS_TO_USE="$LINKS"
+  if [ "$TEST_MODE" -eq 1 ]; then
+    LINKS_TO_USE="$(printf "%s\n" "$LINKS" | sed -n '1p')"
+    log "TEST MODE: only the first APK will be processed."
+  fi
+
+  printf "%s\n" "$LINKS_TO_USE" | while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    fname="${url##*/}"
+
+    # Clean zero-byte leftovers
+    if [ -f "$fname" ] && [ ! -s "$fname" ]; then
+      rm -f "$fname"
+    fi
+
+    log "Fetching: $fname"
+    if ! download_file "$url" "$fname"; then
+      log "Download failed: $fname — skipping."
+      continue
+    fi
+    if [ ! -s "$fname" ]; then
+      log "Empty file after download: $fname — skipping."
+      continue
+    fi
+
+    size="$(file_size_bytes "$fname")"
+    log "Installing: $fname (${size} bytes)"
+    if pm_install_root "$PWD/$fname"; then
+      log "Install success: $fname"
+      if [ "$KEEP_APKS" = "0" ]; then
+        rm -f "$fname" || true
+      else
+        log "KEEP_APKS=1 — keeping $fname"
+      fi
+    else
+      log "Install FAILED: $fname"
+    fi
+  done
+
+  log "Install phase complete."
+}
+
+# ---------------------- Daemonize / foreground ----------------------
+start_daemon() {
+  # Prevent duplicate
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || true)"
+    if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
+      printf "Daemon already running (PID %s). Exiting.\n" "$oldpid"
+      exit 0
+    else
+      rm -f "$PIDFILE" || true
+    fi
+  fi
+
+  # Spawn child; child will handle logging to LOGFILE
+  if have_cmd nohup; then
+    nohup "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" >/dev/null 2>&1 &
+  else
+    "$0" --pidfile "$PIDFILE" --logfile "$LOGFILE" >/dev/null 2>&1 &
+  fi
+  childpid=$!
+  printf "%s\n" "$childpid" > "$PIDFILE"
+  printf "Started daemon (PID %s) — log: %s\n" "$childpid" "$LOGFILE"
+  exit 0
+}
+
+# If requested, daemonize
+if [ "$DAEMONIZE" -eq 1 ]; then
+  start_daemon
+fi
+
+# Foreground mode: write PID, clean up on exit, redirect logs if requested
+printf "%s\n" "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE" >/dev/null 2>&1 || true; exit 0' INT TERM EXIT
+
+# Redirect stdout/stderr to logfile if provided
+if [ -n "$LOGFILE" ]; then
+  # Ensure directory exists
+  mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+  # Redirect current shell
+  exec >>"$LOGFILE" 2>&1
+fi
+
+# One-shot mode
+if [ "$ONCE_MODE" -eq 1 ]; then
+  do_downloads_and_installs
+  exit 0
+fi
+
+# Default: daemon polling loop
+last_state=""
+if [ -f "$STATE_FILE" ]; then
+  last_state="$(cat "$STATE_FILE" 2>/dev/null || true)"
+fi
+log "Daemon polling every ${POLL_INTERVAL}s"
+while :; do
+  remote="$(get_remote_flag || true)"
+  if [ -z "$remote" ]; then
+    log "Trigger unreachable — sleeping ${POLL_INTERVAL}s."
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
+
+  if [ "$remote" != "$last_state" ]; then
+    log "Trigger change: '$last_state' -> '$remote'"
+    if [ "$remote" = "1" ]; then
+      do_downloads_and_installs
+    else
+      log "Trigger is idle (0)"
+    fi
+    printf "%s" "$remote" > "$STATE_FILE"
+    last_state="$remote"
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
+
+# End of file
