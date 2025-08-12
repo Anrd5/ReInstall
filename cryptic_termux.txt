@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# cryptic_termux.sh
+# Standalone Termux daemon for APK + JSON tasks with GitHub trigger gating,
+# and a foreground post-task script (reconnect.lua).
+
+set -Eeuo pipefail
+
+# ===================== Configuration =====================
+# Poll interval (seconds)
+POLL_INTERVAL="${POLL_INTERVAL:-30}"
+
+# Where to store APKs (Termux-private)
+APK_DIR="${APK_DIR:-$HOME/apks}"
+
+# State directory (last-seen triggers, flags, logs)
+STATE_DIR="${STATE_DIR:-$HOME/.cryptic_state}"
+LOG_FILE="${LOG_FILE:-$STATE_DIR/cryptic.log}"
+PID_FILE="${PID_FILE:-$STATE_DIR/cryptic.pid}"
+LOCK_FILE="${LOCK_FILE:-$STATE_DIR/cryptic.lock}"
+
+# Trigger endpoints (override if your repo paths differ)
+APK_TRIGGER_URL="${APK_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/triggers/apk.trigger}"
+JSON_TRIGGER_URL="${JSON_TRIGGER_URL:-https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/triggers/json.trigger}"
+
+# APK links (Termux-private directory; will be deleted after install)
+APK_LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# JSON source and destination
+JSON_SRC_URL="${JSON_SRC_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json}"
+JSON_DEST_DIR="${JSON_DEST_DIR:-/storage/emulated/0/Cryptic/Workspace/SpeedHubX}"
+JSON_DEST_NAME="${JSON_DEST_NAME:-Grow a Garden.json}"
+JSON_DEST_PATH="$JSON_DEST_DIR/$JSON_DEST_NAME"
+
+# Other related script (foreground only)
+OTHER_FETCH_CMD='curl -L -o /sdcard/download/reconnect.lua http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg'
+OTHER_RUN_CMD='lua /sdcard/download/reconnect.lua'
+
+# ================ Utilities and logging ==================
+mkdir -p "$STATE_DIR" "$APK_DIR"
+touch "$LOG_FILE"
+
+log() { printf '[%(%Y-%m-%dT%H:%M:%S%z)T] %s\n' -1 "$*" | tee -a "$LOG_FILE"; }
+
+# Single-instance lock
+exec 9>"$LOCK_FILE" || true
+if ! flock -n 9; then
+  log "Another instance is running. Exiting."
+  exit 0
+fi
+
+echo "$$" > "$PID_FILE"
+
+cleanup() {
+  rm -f "$PID_FILE"
+  log "Exiting."
+}
+trap cleanup EXIT INT TERM
+
+# Downloader selection
+DL_TOOL=""
+if command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+elif command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+else
+  log "Installing curl..."
+  pkg update -y >/dev/null 2>&1 || true
+  pkg install -y curl >/dev/null 2>&1 || true
+  command -v curl >/dev/null 2>&1 && DL_TOOL="curl"
+fi
+[ -z "$DL_TOOL" ] && { log "No downloader available."; exit 1; }
+log "Using downloader: $DL_TOOL"
+
+# Root executor for pm install
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu -c"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  log "Root helper (tsu/su) not found. pm install may fail."
+  ROOT_CMD=""
+fi
+
+# Ensure lua present for OTHER_RUN_CMD
+ensure_lua() {
+  if ! command -v lua >/dev/null 2>&1; then
+    log "Installing lua..."
+    pkg install -y lua >/dev/null 2>&1 || {
+      log "Failed to install lua."
+      return 1
+    }
+  fi
+}
+
+# External storage permission for JSON write
+ensure_storage() {
+  if [ ! -d "/storage/emulated/0" ]; then
+    log "Requesting storage permission..."
+    if command -v termux-setup-storage >/dev/null 2>&1; then
+      termux-setup-storage || true
+    fi
+  fi
+  mkdir -p "$JSON_DEST_DIR" || true
+}
+
+# ================= Reconnect / retry core =================
+# Generic retry with exponential backoff
+reconnect() {
+  # Usage: reconnect <retries> <initial_wait_seconds> -- <command...>
+  local retries="$1"; shift
+  local wait="$1"; shift
+  if [ "$1" != "--" ]; then
+    log "reconnect usage: reconnect <retries> <wait> -- <cmd...>"
+    return 2
+  fi
+  shift
+  local attempt=0
+  until "$@"; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge "$retries" ]; then
+      log "Reconnect: giving up after $attempt attempts: $*"
+      return 1
+    fi
+    log "Reconnect: attempt $attempt failed. Retrying in ${wait}s..."
+    sleep "$wait"
+    # Exponential backoff up to 60s
+    [ "$wait" -lt 60 ] && wait=$((wait * 2))
+  done
+  return 0
+}
+
+fetch_text() {
+  local url="$1"
+  if [ "$DL_TOOL" = "curl" ]; then
+    curl -fsSL --max-time 20 "$url"
+  else
+    wget -qO- "$url"
+  fi
+}
+
+download_file() {
+  local url="$1" out="$2"
+  if [ "$DL_TOOL" = "curl" ]; then
+    curl -fL --retry 5 --retry-delay 2 --speed-time 15 --speed-limit 1024 -C - -o "$out" "$url"
+  else
+    wget -c --tries=5 --timeout=20 -O "$out" "$url"
+  fi
+}
+
+# ================== APK install workflow ==================
+install_apk_root() {
+  local apk="$1"
+  if [ -n "$ROOT_CMD" ]; then
+    $ROOT_CMD "pm install -r -g '$apk'"
+  else
+    pm install -r -g "$apk"
+  fi
+}
+
+process_apks_once() {
+  log "APK: starting download+install"
+  mkdir -p "$APK_DIR"
+  local ok_any=0
+  for url in "${APK_LINKS[@]}"; do
+    local name="${url##*/}"
+    local path="$APK_DIR/$name"
+    log "APK: fetching $name"
+    if ! reconnect 5 2 -- download_file "$url" "$path.part"; then
+      log "APK: failed to download $name"
+      continue
+    fi
+    mv -f "$path.part" "$path"
+    # Sanity check non-empty
+    if [ ! -s "$path" ]; then
+      log "APK: $name is empty, skipping"
+      rm -f "$path"
+      continue
+    fi
+    log "APK: installing $name"
+    if install_apk_root "$path"; then
+      log "APK: installed $name"
+      ok_any=1
+      rm -f "$path" || true
+    else
+      log "APK: install failed for $name"
+      # Keep file for manual debug? Requirements say delete after install.
+      # We only delete on success.
+    fi
+  done
+  log "APK: cycle complete"
+  return "$ok_any"
+}
+
+# =================== JSON replace workflow ===================
+process_json_once() {
+  log "JSON: starting download+replace"
+  ensure_storage
+  mkdir -p "$JSON_DEST_DIR"
+  local tmp="$STATE_DIR/json.tmp"
+  if ! reconnect 5 2 -- download_file "$JSON_SRC_URL" "$tmp.part"; then
+    log "JSON: failed to download source"
+    rm -f "$tmp.part"
+    return 1
+  fi
+  mv -f "$tmp.part" "$tmp"
+  if [ ! -s "$tmp" ]; then
+    log "JSON: downloaded file is empty"
+    rm -f "$tmp"
+    return 1
+  fi
+  # Replace contents atomically
+  if mv -f "$tmp" "$JSON_DEST_PATH"; then
+    log "JSON: replaced -> $JSON_DEST_PATH"
+    return 0
+  else
+    log "JSON: failed to move into place"
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# =================== Other related script ===================
+run_other_script_foreground() {
+  log "OTHER: fetching reconnect.lua"
+  if ! reconnect 5 2 -- bash -c "$OTHER_FETCH_CMD"; then
+    log "OTHER: failed to fetch reconnect.lua"
+    return 1
+  fi
+  ensure_lua || { log "OTHER: lua not available"; return 1; }
+  log "OTHER: running (foreground)"
+  # Foreground, no backgrounding
+  bash -c "$OTHER_RUN_CMD"
+  local rc=$?
+  log "OTHER: finished with code $rc"
+  return $rc
+}
+
+# =================== Trigger management ===================
+LAST_APK_FILE="$STATE_DIR/last_apk_trigger"
+LAST_JSON_FILE="$STATE_DIR/last_json_trigger"
+FIRST_RUN_FILE="$STATE_DIR/first_run_done"
+
+read_last() { [ -f "$1" ] && cat "$1" || echo ""; }
+
+fingerprint_url() {
+  local url="$1"
+  reconnect 5 2 -- fetch_text "$url" | tr -d '\r' || true
+}
+
+# =================== Termux:Boot hook ===================
+install_boot_hook() {
+  local boot_dir="$HOME/.termux/boot"
+  mkdir -p "$boot_dir"
+  cat > "$boot_dir/01-cryptic.sh" <<"EOF"
+#!/data/data/com.termux/files/usr/bin/bash
+# Auto-start cryptic_termux.sh at boot if present.
+SCRIPT="$HOME/cryptic_termux.sh"
+LOG="$HOME/.cryptic_state/boot.log"
+if [ -f "$SCRIPT" ]; then
+  nohup "$SCRIPT" >>"$LOG" 2>&1 &
+fi
+EOF
+  chmod +x "$boot_dir/01-cryptic.sh"
+  log "Installed Termux:Boot hook at $boot_dir/01-cryptic.sh (Termux:Boot app must be installed)."
+}
+
+# =================== Initial run ===================
+if [ "${1:-}" = "--install-boot" ]; then
+  install_boot_hook
+  exit 0
+fi
+
+log "Daemon starting. Poll every ${POLL_INTERVAL}s"
+
+# Run both workflows on first start (once), then record triggers
+if [ ! -f "$FIRST_RUN_FILE" ]; then
+  log "First run: executing APK + JSON tasks"
+  process_apks_once || true
+  process_json_once || true
+  # After both finish, run OTHER if no new triggers arrive mid-flight (first run has none yet).
+  run_other_script_foreground || true
+  touch "$FIRST_RUN_FILE"
+fi
+
+# Initialize last-seen fingerprints (don’t trigger immediate runs if unchanged)
+APK_LAST="$(read_last "$LAST_APK_FILE")"
+JSON_LAST="$(read_last "$LAST_JSON_FILE")"
+
+# Main loop
+while true; do
+  # Read current trigger fingerprints (content-based)
+  APK_CUR="$(fingerprint_url "$APK_TRIGGER_URL" || echo "")"
+  JSON_CUR="$(fingerprint_url "$JSON_TRIGGER_URL" || echo "")"
+
+  # Flags to decide runs
+  run_apk=0
+  run_json=0
+
+  if [ -n "$APK_CUR" ] && [ "$APK_CUR" != "$APK_LAST" ]; then
+    log "APK trigger changed"
+    run_apk=1
+  fi
+  if [ -n "$JSON_CUR" ] && [ "$JSON_CUR" != "$JSON_LAST" ]; then
+    log "JSON trigger changed"
+    run_json=1
+  fi
+
+  # Process as needed
+  if [ "$run_apk" -eq 1 ] || [ "$run_json" -eq 1 ]; then
+    # Snapshot triggers before work to detect interference
+    APK_BEFORE="$APK_CUR"
+    JSON_BEFORE="$JSON_CUR"
+
+    [ "$run_apk" -eq 1 ] && process_apks_once || true
+    [ "$run_json" -eq 1 ] && process_json_once || true
+
+    # Update last-seen to what we started with so “once per run” semantics hold
+    if [ "$run_apk" -eq 1 ]; then
+      printf '%s' "$APK_BEFORE" > "$LAST_APK_FILE"
+      APK_LAST="$APK_BEFORE"
+    fi
+    if [ "$run_json" -eq 1 ]; then
+      printf '%s' "$JSON_BEFORE" > "$LAST_JSON_FILE"
+      JSON_LAST="$JSON_BEFORE"
+    fi
+
+    # Re-read triggers to see if they changed during the above work
+    APK_AFTER="$(fingerprint_url "$APK_TRIGGER_URL" || echo "")"
+    JSON_AFTER="$(fingerprint_url "$JSON_TRIGGER_URL" || echo "")"
+
+    # Only run OTHER if no new trigger arrived in the meantime
+    if [ "$APK_AFTER" = "$APK_BEFORE" ] && [ "$JSON_AFTER" = "$JSON_BEFORE" ]; then
+      run_other_script_foreground || true
+    else
+      log "OTHER: skipped because new trigger(s) arrived during processing"
+    fi
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
