@@ -1,5 +1,4 @@
-name: RefreshScript (JSON trigger)
-
+name: RefreshScript
 on:
   workflow_dispatch:
 
@@ -7,26 +6,29 @@ permissions:
   contents: write
 
 jobs:
-  trigger-json:
+  bump-json-trigger:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Write trigger file
+      - name: Bump nonce inside this workflow
         run: |
-          mkdir -p triggers
-          {
-            echo "RUN_ID=${GITHUB_RUN_ID}"
-            echo "RUN_NUMBER=${GITHUB_RUN_NUMBER}"
-            echo "TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "COMMIT_SHA=${GITHUB_SHA}"
-          } > triggers/json.trigger
+          file=".github/workflows/RefreshScript.yml"
+          stamp="# nonce: $(date -u +%Y%m%dT%H%M%SZ) run=${GITHUB_RUN_ID}"
+          if grep -q '^# nonce:' "$file"; then
+            sed -i "s/^# nonce:.*/$stamp/" "$file"
+          else
+            printf "\n%s\n" "$stamp" >> "$file"
+          fi
 
-      - name: Commit and push trigger
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add triggers/json.trigger
-          git commit -m "JSON trigger: run $GITHUB_RUN_ID at $(date -u +%F\ %T) UTC" || echo "No changes to commit"
+          git add .github/workflows/RefreshScript.yml
+          git commit -m "RefreshScript nonce bump: ${GITHUB_RUN_ID}" || echo "No changes to commit"
           git push
+# nonce: 19700101T000000Z run=0
