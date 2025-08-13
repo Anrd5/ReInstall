@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# cryptic_daemon.sh — robust, always-0 on normal flows
+
+# ----------------- Strict-ish mode -----------------
+# We avoid `set -e` so recoverable steps don't kill the script.
+set -u
+
+# ----------------- Configuration -----------------
+WORKDIR="${WORKDIR:-$HOME/cryptic_apks}"
+KEEP_APKS="${KEEP_APKS:-0}"              # 0 = delete after success, 1 = keep
+POLL_INTERVAL="${POLL_INTERVAL:-30}"     # seconds
+TRIGGER_URL="${TRIGGER_URL:-https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/RefreshClones.txt}"
+
+STATE_FILE="${WORKDIR}/.last_refresh_state"
+PIDFILE_DEFAULT="${WORKDIR}/cryptic_daemon.pid"
+LOGFILE_DEFAULT="${HOME}/cryptic_daemon.log"
+
+LINKS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+DAEMONIZE=0
+TEST_MODE=0
+PIDFILE=""
+LOGFILE=""
+INTERNAL_CHILD=0
+
+# ----------------- Logging -----------------
+log() {
+  # ISO-like timestamp
+  local ts; ts="$(date +%Y-%m-%dT%H:%M:%S)"
+  if [ -n "${LOGFILE:-}" ]; then
+    printf '[%s] %s\n' "$ts" "$*" | tee -a "$LOGFILE"
+  else
+    printf '[%s] %s\n' "$ts" "$*"
+  fi
+}
+
+# ----------------- Fatal helper -----------------
+EXIT_CODE=0
+fatal() {
+  EXIT_CODE=1
+  log "FATAL: $*"
+  exit 1
+}
+
+cleanup() {
+  # Don't error on cleanup issues
+  [ -n "${PIDFILE:-}" ] && rm -f "$PIDFILE" 2>/dev/null || true
+  log "Exiting (code $EXIT_CODE)"
+  # Ensure the process returns the intended code
+  exit "$EXIT_CODE"
+}
+
+trap cleanup EXIT
+trap 'EXIT_CODE=130; exit 130' INT
+trap 'EXIT_CODE=143; exit 143' TERM
+
+# ----------------- Argument parsing -----------------
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --daemonize            Run in background (writes PID to --pidfile)
+  --pidfile <path>       Set PID file (default: ${PIDFILE_DEFAULT})
+  --logfile <path>       Set log file (default: ${LOGFILE_DEFAULT})
+  --test                 Test mode (only first APK)
+  --help                 Show help
+
+Env: WORKDIR, KEEP_APKS, POLL_INTERVAL, TRIGGER_URL
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --daemonize) DAEMONIZE=1 ;;
+    --pidfile)   shift; PIDFILE="${1:-}";;
+    --logfile)   shift; LOGFILE="${1:-}";;
+    --test)      TEST_MODE=1 ;;
+    --as-child)  INTERNAL_CHILD=1 ;; # internal use for daemonization
+    --help|-h)   usage; exit 0 ;;
+    *)           usage; fatal "Unknown option: $1" ;;
+  esac
+  shift || true
+done
+
+PIDFILE="${PIDFILE:-$PIDFILE_DEFAULT}"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+
+# ----------------- Prepare workspace -----------------
+mkdir -p "$WORKDIR" || fatal "Cannot create $WORKDIR"
+cd "$WORKDIR" || fatal "Cannot cd to $WORKDIR"
+
+# ----------------- Downloader detection -----------------
+DL_TOOL=""
+if command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
+elif command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+else
+  # Best-effort install in Termux; non-fatal if it fails
+  log "No downloader found. Attempting to install curl via pkg..."
+  if command -v pkg >/dev/null 2>&1; then
+    pkg update -y >/dev/null 2>&1 || true
+    pkg install -y curl >/dev/null 2>&1 || true
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    DL_TOOL="curl"
+  elif command -v wget >/dev/null 2>&1; then
+    DL_TOOL="wget"
+  else
+    # Not fatal for the whole script; we can still run the loop and retry later.
+    log "Warning: no downloader available (curl/wget). Will retry later."
+  fi
+fi
+
+log "Using downloader: ${DL_TOOL:-none}"
+
+download_file() {
+  # download_file <url> <output>
+  local url="$1" out="$2"
+  [ -z "$DL_TOOL" ] && return 2
+  if [ "$DL_TOOL" = "curl" ]; then
+    curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$url"
+  else
+    wget -q -O "$out" "$url"
+  fi
+}
+
+# ----------------- Root command handling -----------------
+ROOT_CMD=""
+if command -v tsu >/dev/null 2>&1; then
+  ROOT_CMD="tsu -c"
+elif command -v su >/dev/null 2>&1; then
+  ROOT_CMD="su -c"
+else
+  # Do NOT hard-fail: we keep running and just skip installs until root exists.
+  log "Warning: no root helper (tsu/su). Will download, then skip install until root is available."
+fi
+
+install_apk() {
+  # install_apk <absolute_apk_path>
+  local apk="$1"
+  if [ -z "$ROOT_CMD" ]; then
+    log "Install skipped (no root): $apk"
+    return 0
+  fi
+  # Quote inside the root shell to handle spaces safely
+  $ROOT_CMD "pm install -r -g '$apk'" >/dev/null 2>&1
+}
+
+# ----------------- Trigger fetch -----------------
+get_remote_flag() {
+  # Returns: "0" or "1" or empty if unreachable
+  local content=""
+  if [ "$DL_TOOL" = "curl" ]; then
+    content="$(curl -fsSL "$TRIGGER_URL" 2>/dev/null || true)"
+  elif [ "$DL_TOOL" = "wget" ]; then
+    content="$(wget -qO- "$TRIGGER_URL" 2>/dev/null || true)"
+  else
+    echo ""
+    return 0
+  fi
+  content="$(printf '%s' "$content" | tr -d '[:space:]' | cut -c1)"
+  case "$content" in
+    0|1) printf '%s' "$content" ;;
+    *)   printf '' ;;
+  endesac
+}
+
+# ----------------- Install batch -----------------
+do_downloads_and_installs() {
+  log "Launching downloads..."
+  for url in "${LINKS[@]}"; do
+    local fname="${url##*/}"
+    # If a zero-size leftover exists, remove it
+    [ -f "$fname" ] && [ ! -s "$fname" ] && rm -f "$fname"
+
+    log "Fetching: $fname"
+    if ! download_file "$url" "$fname"; then
+      log "Failed to download $fname. Skipping."
+      continue
+    fi
+
+    if [ ! -s "$fname" ]; then
+      log "Empty file for $fname. Skipping install."
+      continue
+    fi
+
+    # Size (portable)
+    local size=""
+    if stat -c%s "$fname" >/dev/null 2>&1; then
+      size="$(stat -c%s "$fname" 2>/dev/null || echo "?")"
+    else
+      size="$(ls -l "$fname" | awk '{print $5}')"
+    fi
+    log "Installing: $fname ($size bytes)"
+
+    if install_apk "$PWD/$fname"; then
+      log "Success: $fname"
+      if [ "${KEEP_APKS:-0}" = "0" ]; then
+        rm -f "$fname" || true
+      else
+        log "Keeping file."
+      fi
+    else
+      log "Failed install: $fname"
+    fi
+  done
+  log "Install phase complete."
+}
+
+# ----------------- Test mode -----------------
+if [ "$TEST_MODE" = 1 ]; then
+  LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+  mkdir -p "$(dirname "$LOGFILE")" || true
+  log "TEST MODE ACTIVE"
+  LINKS=("${LINKS[0]}")
+  do_downloads_and_installs
+  EXIT_CODE=0
+  exit 0
+fi
+
+# ----------------- Daemonize (parent process) -----------------
+if [ "$DAEMONIZE" = 1 ] && [ "$INTERNAL_CHILD" = 0 ]; then
+  mkdir -p "$(dirname "$LOGFILE")" || true
+  mkdir -p "$(dirname "$PIDFILE")" || true
+
+  if [ -f "$PIDFILE" ]; then
+    oldpid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "Daemon already running (PID $oldpid)."
+      EXIT_CODE=0
+      exit 0
+    else
+      rm -f "$PIDFILE" 2>/dev/null || true
+    fi
+  fi
+
+  nohup "$0" --as-child --pidfile "$PIDFILE" --logfile "$LOGFILE" \
+    >/dev/null 2>&1 &
+
+  childpid=$!
+  echo "$childpid" > "$PIDFILE"
+  echo "Started daemon (PID $childpid) -> $LOGFILE"
+  EXIT_CODE=0
+  exit 0
+fi
+
+# ----------------- Child/foreground main loop -----------------
+# Record PID for child/foreground
+echo "$$" > "$PIDFILE"
+
+last_state=""
+[ -f "$STATE_FILE" ] && last_state="$(cat "$STATE_FILE" 2>/dev/null || echo "")"
+
+log "Daemon polling every ${POLL_INTERVAL}s"
+while :; do
+  remote="$(get_remote_flag || echo "")"
+  if [ -z "$remote" ]; then
+    log "Trigger unreachable. Sleeping ${POLL_INTERVAL}s."
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
+
+  if [ "$remote" != "$last_state" ]; then
+    log "Trigger change detected -> '$last_state' -> '$remote'"
+    if [ "$remote" = "1" ]; then
+      do_downloads_and_installs
+    else
+      log "Trigger is idle (0)"
+    fi
+    echo "$remote" > "$STATE_FILE"
+    last_state="$remote"
+  fi
+
+  sleep "$POLL_INTERVAL"
+done
