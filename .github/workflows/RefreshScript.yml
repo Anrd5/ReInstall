@@ -1,26 +1,35 @@
 name: RefreshScript
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
+  repository_dispatch:
+    types: [json]
 
 jobs:
-  trigger-json:
+  write-json-trigger:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write JSON trigger token
+      - name: Prepare trigger
         run: |
           mkdir -p .triggers
-          echo "{\"token\":\"json-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",\"run_id\":\"${GITHUB_RUN_ID}\",\"time\":\"${{ github.event.repository.updated_at || github.run_started_at }}\"}" > .triggers/json.json
+          ID="$(cat /proc/sys/kernel/random/uuid)"
+          TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          cat > .triggers/json.json <<EOF
+          {
+            "id": "${ID}",
+            "ts": "${TS}",
+            "type": "json"
+          }
+          EOF
 
-      - name: Commit and push trigger
+      - name: Commit trigger
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .triggers/json.json
-          git commit -m "JSON trigger ${GITHUB_RUN_ID}"
+          git commit -m "JSON trigger: ${GITHUB_RUN_ID} ${GITHUB_SHA}" || echo "No changes"
           git push
