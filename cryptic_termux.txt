@@ -1,0 +1,321 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Standalone Termux automation for APK, JSON, and Other flows
+# Android 10 / VMOS Cloud / Termux + Magisk + tsu
+# - Continuous loop; hook via Termux:Boot
+# - Uses $HOME/apks for APKs (not /sdcard/Download)
+# - Runs "Other" only when APK/JSON are idle
+# - No curl (22) by pre-checking HTTP status
+# - Deletes APKs after successful install
+# - First run executes all flows once
+
+set -Eeuo pipefail
+
+# ----------------------------- Config -----------------------------
+# GitHub trigger files written by workflows below
+TRIGGER_APK_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.triggers/apk.json"
+TRIGGER_JSON_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.triggers/json.json"
+
+# APK direct links (Termux will download into $HOME/apks)
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# JSON source and destination
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+JSON_DST_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+JSON_DST_FILE="${JSON_DST_DIR}/Grow a Garden.json"
+
+# Other-related script (exact path and run command as provided)
+OTHER_LUA_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+OTHER_LUA_PATH="/sdcard/download/reconnect.lua"
+OTHER_LUA_RUN=("lua" "/sdcard/download/reconnect.lua")
+
+# Loop interval and "Other" minimum interval
+LOOP_SECONDS=120
+OTHER_MINUTES=30
+
+# ----------------------------- Paths & State -----------------------------
+PREFIX="/data/data/com.termux/files"
+HOME_DIR="${PREFIX}/home"
+LOG_DIR="${HOME_DIR}/.automanager"
+STATE_DIR="${LOG_DIR}"
+APK_DIR="${HOME_DIR}/apks"
+TMP_DIR="${HOME_DIR}/.tmp_automanager"
+
+LOCK_FILE="${STATE_DIR}/lock"
+LAST_APK_ID_FILE="${STATE_DIR}/last_apk_id"
+LAST_JSON_ID_FILE="${STATE_DIR}/last_json_id"
+LAST_OTHER_TS_FILE="${STATE_DIR}/last_other_ts"
+
+mkdir -p "${APK_DIR}" "${TMP_DIR}" "${STATE_DIR}"
+
+# Single-instance lock
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "[INFO] Another instance is running; exiting."
+  exit 0
+fi
+
+# ----------------------------- Utilities -----------------------------
+log() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    log "Missing dependency: $1. Install it in Termux (e.g., pkg install $1)."
+    exit 1
+  }
+}
+
+# We avoid curl (22) by checking status first; we don't use --fail/--fail-with-body.
+http_status() {
+  # Returns HTTP status code or 000 on error/timeout
+  curl -sIL --connect-timeout 15 --max-time 60 -o /dev/null -w '%{http_code}' "$1" || echo "000"
+}
+
+download_file() {
+  # Args: URL DEST
+  local url="$1" dest="$2"
+  local code
+  code="$(http_status "${url}")"
+  if [ "${code}" != "200" ]; then
+    log "Skip download (HTTP ${code}) for: ${url}"
+    return 1
+  fi
+  curl -sS -L --connect-timeout 15 --max-time 600 --retry 5 --retry-delay 2 --retry-connrefused -o "${dest}" "${url}" || {
+    log "Download failed: ${url}"
+    return 1
+  }
+  if [ ! -s "${dest}" ]; then
+    log "Downloaded empty file, removing: ${dest}"
+    rm -f -- "${dest}"
+    return 1
+  fi
+  # Basic HTML check to avoid GitHub "not found" HTML downloads
+  if head -c 512 "${dest}" | tr -d '\r\0' | grep -qiE '<html|<!doctype html'; then
+    log "Downloaded content looks like HTML (possible bad URL). Removing: ${dest}"
+    rm -f -- "${dest}"
+    return 1
+  fi
+  return 0
+}
+
+sha256() { sha256sum "$1" | awk '{print $1}'; }
+
+# Extract a JSON id value without jq; expects a line like:  "id": "abcdef"
+json_get_id() {
+  # Args: file
+  sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+get_trigger_id() {
+  # Args: URL OUTFILE
+  local url="$1" of="$2"
+  local code
+  code="$(http_status "${url}")"
+  if [ "${code}" != "200" ]; then
+    echo ""
+    return 0
+  fi
+  curl -sS -L --connect-timeout 15 --max-time 60 -o "${of}" "${url}" || { echo ""; return 0; }
+  # Try id field, else fallback to sha256 of content as a stable change marker
+  local id
+  id="$(json_get_id "${of}")"
+  if [ -n "${id}" ]; then
+    echo "${id}"
+  else
+    sha256 "${of}"
+  fi
+}
+
+ensure_termux_storage() {
+  # Grant storage on first run so we can write under /storage/emulated/0
+  if ! [ -d /sdcard/Download ]; then
+    log "Requesting storage access (termux-setup-storage)..."
+    yes | termux-setup-storage || true
+  fi
+}
+
+# ----------------------------- Flows -----------------------------
+run_apk_flow() {
+  log "APK flow: start"
+  local any_installed=0
+  for url in "${APK_URLS[@]}"; do
+    local fname base dest
+    base="${url##*/}"
+    fname="${base%?}.apk"
+    dest="${APK_DIR}/${base}"
+
+    log "Downloading APK: ${url}"
+    if ! download_file "${url}" "${dest}"; then
+      log "Skipping install for: ${url}"
+      continue
+    fi
+
+    # Install with root via tsu; try cmd package first, then pm
+    log "Installing APK: ${dest}"
+    if tsu -c "cmd package install -r -g \"${dest}\"" >/dev/null 2>&1; then
+      log "Installed via cmd: ${base}"
+      any_installed=1
+    elif tsu -c "pm install -r -g \"${dest}\"" >/dev/null 2>&1; then
+      log "Installed via pm: ${base}"
+      any_installed=1
+    else
+      log "Install failed: ${base}"
+      # Leave the file to allow reattempt next loop; or clean to prevent clutter
+      rm -f -- "${dest}" || true
+      continue
+    fi
+
+    # Delete the APK after successful install
+    rm -f -- "${dest}" || true
+    log "Deleted APK after install: ${base}"
+  done
+  log "APK flow: done"
+  return ${any_installed}
+}
+
+run_json_flow() {
+  log "JSON flow: start"
+  ensure_termux_storage
+  mkdir -p "${JSON_DST_DIR}"
+
+  local tmp_json="${TMP_DIR}/incoming.json"
+  log "Downloading JSON: ${JSON_URL}"
+  if ! download_file "${JSON_URL}" "${tmp_json}"; then
+    log "JSON download failed; will retry later."
+    return 1
+  fi
+
+  # Very light validation: starts with { or [
+  if ! head -c 1 "${tmp_json}" | grep -qE '[{
+
+\[]'; then
+    log "Downloaded JSON doesn't look valid; aborting replace."
+    rm -f -- "${tmp_json}" || true
+    return 1
+  fi
+
+  # Replace contents atomically (write temp then move)
+  local tmp_dst="${TMP_DIR}/Grow_a_Garden.json.tmp"
+  cp -f -- "${tmp_json}" "${tmp_dst}"
+  sync
+
+  # Use Termux user (not root) to write into /storage/emulated/0 (safer with scoped storage)
+  mv -f -- "${tmp_dst}" "${JSON_DST_FILE}"
+  sync
+  rm -f -- "${tmp_json}" || true
+
+  log "JSON flow: replaced ${JSON_DST_FILE}"
+  log "JSON flow: done"
+  return 0
+}
+
+run_other_flow() {
+  log "Other flow: start"
+  ensure_termux_storage
+  mkdir -p "/sdcard/download"
+
+  # Download lua file exactly as requested, but with status pre-check and retries
+  if ! download_file "${OTHER_LUA_URL}" "${OTHER_LUA_PATH}"; then
+    log "Other flow: lua download failed; aborting this run."
+    return 1
+  fi
+
+  # Run in foreground; do not background
+  "${OTHER_LUA_RUN[@]}"
+  local rc=$?
+
+  # Enforce "No zero exit codes when reconnect.lua is executed"
+  if [ ${rc} -eq 0 ]; then
+    log "Other flow: reconnect.lua returned 0; remapping to 99 per requirement."
+    rc=99
+  fi
+
+  log "Other flow: finished with code ${rc}"
+  return ${rc}
+}
+
+# ----------------------------- Main Loop -----------------------------
+require_cmd curl
+require_cmd tsu
+require_cmd sha256sum
+
+# First-run logic: run both flows on first start
+FIRST_RUN=0
+if [ ! -f "${LAST_APK_ID_FILE}" ] || [ ! -f "${LAST_JSON_ID_FILE}" ]; then
+  FIRST_RUN=1
+  echo "first-run" > "${LAST_APK_ID_FILE}"
+  echo "first-run" > "${LAST_JSON_ID_FILE}"
+  log "First run: baseline state created."
+fi
+
+# Main loop
+while true; do
+  local_apk_id="$(cat "${LAST_APK_ID_FILE}" 2>/dev/null || true)"
+  local_json_id="$(cat "${LAST_JSON_ID_FILE}" 2>/dev/null || true)"
+
+  tmp_apk="${TMP_DIR}/apk.trigger"
+  tmp_json="${TMP_DIR}/json.trigger"
+
+  remote_apk_id="$(get_trigger_id "${TRIGGER_APK_URL}" "${tmp_apk}" || echo "")"
+  remote_json_id="$(get_trigger_id "${TRIGGER_JSON_URL}" "${tmp_json}" || echo "")"
+
+  # Decide if flows should run
+  run_apk=0
+  run_json=0
+
+  if [ ${FIRST_RUN} -eq 1 ]; then
+    run_apk=1
+    run_json=1
+    FIRST_RUN=0
+    log "First loop: will run both APK and JSON flows."
+  else
+    if [ -n "${remote_apk_id}" ] && [ "${remote_apk_id}" != "${local_apk_id}" ]; then
+      run_apk=1
+      log "APK trigger changed: ${local_apk_id} -> ${remote_apk_id}"
+    fi
+    if [ -n "${remote_json_id}" ] && [ "${remote_json_id}" != "${local_json_id}" ]; then
+      run_json=1
+      log "JSON trigger changed: ${local_json_id} -> ${remote_json_id}"
+    fi
+  fi
+
+  did_work=0
+
+  if [ ${run_apk} -eq 1 ]; then
+    run_apk_flow || true
+    echo "${remote_apk_id:-${local_apk_id}}" > "${LAST_APK_ID_FILE}"
+    did_work=1
+  fi
+
+  if [ ${run_json} -eq 1 ]; then
+    run_json_flow || true
+    echo "${remote_json_id:-${local_json_id}}" > "${LAST_JSON_ID_FILE}"
+    did_work=1
+  fi
+
+  # Run "Other" only when APK and JSON are idle this cycle
+  if [ ${did_work} -eq 0 ]; then
+    # Rate-limit "Other" to no more than once every OTHER_MINUTES
+    now_epoch="$(date +%s)"
+    last_other_epoch="$(cat "${LAST_OTHER_TS_FILE}" 2>/dev/null || echo 0)"
+    min_gap=$(( OTHER_MINUTES * 60 ))
+    if [ $(( now_epoch - last_other_epoch )) -ge ${min_gap} ]; then
+      run_other_flow || true
+      date +%s > "${LAST_OTHER_TS_FILE}"
+    else
+      log "Other flow: waiting (cooldown ${OTHER_MINUTES} min)."
+    fi
+  else
+    log "Other flow: disabled this cycle because APK/JSON ran."
+  fi
+
+  sleep "${LOOP_SECONDS}"
+done
