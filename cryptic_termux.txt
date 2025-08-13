@@ -301,7 +301,7 @@ process_json_trigger() {
     fi
     if [ "$run_id" != "$last_id" ]; then
       log "New JSON trigger detected (RUN_ID=$run_id, last=$last_id)."
-      download_and_replace_json()
+      download_and_replace_json
       echo "$run_id" > "$JSON_LAST_ID"
       worked=1
     else
