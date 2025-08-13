@@ -230,19 +230,10 @@ task_other_foreground() {
     log "WARN: lua interpreter missing; attempting install"
     apt install -y lua >>"$LOG_FILE" 2>&1 || true
   fi
-  # Foreground execution; retry until success (exit code 0)
-  # No backgrounding; interruptions only if next cycle has triggers.
-  while true; do
-    log "OTHER task: running 'lua $RECONNECT_LUA_PATH' in foreground..."
-    lua "$RECONNECT_LUA_PATH"
-    rc=$?
-    if [ $rc -eq 0 ]; then
-      log "OTHER task: reconnect.lua completed successfully (exit 0)"
-      break
-    else
-      log "OTHER task: reconnect.lua exit $rc; retrying in 10s"
-      sleep 10
-    fi
+  log "OTHER task: running 'lua $RECONNECT_LUA_PATH'..."
+lua "$RECONNECT_LUA_PATH"
+log "OTHER task: finished with exit code $?"
+
   done
 }
 
