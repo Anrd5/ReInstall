@@ -1,35 +1,32 @@
-name: RefreshClones
+name: RefreshClones (APK trigger)
+
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [apk]
+
+permissions:
+  contents: write
 
 jobs:
-  write-apk-trigger:
+  trigger-apk:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare trigger
+      - name: Write trigger file
         run: |
-          mkdir -p .triggers
-          ID="$(cat /proc/sys/kernel/random/uuid)"
-          TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          cat > .triggers/apk.json <<EOF
+          mkdir -p triggers
           {
-            "id": "${ID}",
-            "ts": "${TS}",
-            "type": "apk"
-          }
-          EOF
+            echo "RUN_ID=${GITHUB_RUN_ID}"
+            echo "RUN_NUMBER=${GITHUB_RUN_NUMBER}"
+            echo "TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "COMMIT_SHA=${GITHUB_SHA}"
+          } > triggers/apk.trigger
 
-      - name: Commit trigger
+      - name: Commit and push trigger
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .triggers/apk.json
-          git commit -m "APK trigger: ${GITHUB_RUN_ID} ${GITHUB_SHA}" || echo "No changes"
+          git add triggers/apk.trigger
+          git commit -m "APK trigger: run $GITHUB_RUN_ID at $(date -u +%F\ %T) UTC" || echo "No changes to commit"
           git push
