@@ -1,27 +1,35 @@
 name: RefreshClones
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
+  repository_dispatch:
+    types: [apk]
 
 jobs:
-  trigger-apk:
+  write-apk-trigger:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write APK trigger token
+      - name: Prepare trigger
         run: |
           mkdir -p .triggers
-          # Unique token per run (used by the device to detect changes)
-          echo "{\"token\":\"apk-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",\"run_id\":\"${GITHUB_RUN_ID}\",\"time\":\"${{ github.event.repository.updated_at || github.run_started_at }}\"}" > .triggers/apk.json
+          ID="$(cat /proc/sys/kernel/random/uuid)"
+          TS="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          cat > .triggers/apk.json <<EOF
+          {
+            "id": "${ID}",
+            "ts": "${TS}",
+            "type": "apk"
+          }
+          EOF
 
-      - name: Commit and push trigger
+      - name: Commit trigger
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .triggers/apk.json
-          git commit -m "APK trigger ${GITHUB_RUN_ID}"
+          git commit -m "APK trigger: ${GITHUB_RUN_ID} ${GITHUB_SHA}" || echo "No changes"
           git push
