@@ -234,7 +234,6 @@ task_other_foreground() {
 lua "$RECONNECT_LUA_PATH"
 log "OTHER task: finished with exit code $?"
 
-  done
 }
 
 # --------------- Main Loop ---------------
