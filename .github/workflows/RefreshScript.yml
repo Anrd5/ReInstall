@@ -1,38 +1,26 @@
-name: Refresh JSON Triggers
-
+name: RefreshScript
 on:
-  workflow_dispatch: {}
-  repository_dispatch:
-    types: [refresh-json]
-  schedule:
-    - cron: "15 */12 * * *" # optional: offset schedule
+  workflow_dispatch:
 
 permissions:
   contents: write
 
-concurrency:
-  group: json-trigger
-  cancel-in-progress: false
-
 jobs:
-  write-json-trigger:
+  trigger-json:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare trigger payload
-        id: prep
+      - name: Write JSON trigger token
         run: |
-          mkdir -p .triggers/json
-          printf '{"run_id": %s, "timestamp": "%s"}\n' \
-            "${GITHUB_RUN_ID}" "$(date -u +%FT%TZ)" > .triggers/json/latest.json
-          cat .triggers/json/latest.json
+          mkdir -p .triggers
+          echo "{\"token\":\"json-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\",\"run_id\":\"${GITHUB_RUN_ID}\",\"time\":\"${{ github.event.repository.updated_at || github.run_started_at }}\"}" > .triggers/json.json
 
       - name: Commit and push trigger
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .triggers/json/latest.json
-          git commit -m "JSON trigger: run_id=${GITHUB_RUN_ID}"
+          git add .triggers/json.json
+          git commit -m "JSON trigger ${GITHUB_RUN_ID}"
           git push
