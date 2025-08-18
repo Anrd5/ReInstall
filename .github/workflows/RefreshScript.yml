@@ -1,0 +1,17 @@
+name: Refresh JSON
+
+on:
+  workflow_dispatch:
+
+jobs:
+  json-update:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Run Termux manage.sh
+        run: |
+          chmod +x ~/manage.sh
+          ~/manage.sh
