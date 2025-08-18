@@ -1,0 +1,18 @@
+name: Refresh JSON
+
+on:
+  workflow_dispatch:
+
+jobs:
+  update-json:
+    runs-on:
+      - self-hosted
+      - termux
+
+    steps:
+      - name: Run JSON refresh script
+        run: |
+          curl -fsL https://raw.githubusercontent.com/Anrd5/MyAppCollection/main/update_script.sh \
+            -o update_script.sh
+          chmod +x update_script.sh
+          ./update_script.sh --json
