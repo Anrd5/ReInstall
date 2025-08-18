@@ -1,0 +1,89 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux Android Automation Script
+# Android 10, Rooted (VMOS / Magisk)
+# All-in-one APK + JSON + Final Script Runner
+
+set -e  # Exit on error
+APK_DIR="$HOME/apk_downloads"
+JSON_TMP="$HOME/json_tmp"
+GARDEN_JSON="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
+OTHER_SCRIPT_URL="http://raw.reconnect-tool.top/main/v5/v5GHI789RST654kLmNoPqRsT71mM38FDluVwX321098d1fgg"
+OTHER_SCRIPT_PATH="/sdcard/download/reconnect.lua"
+
+# ----------------------------------------------------
+# FUNCTIONS
+# ----------------------------------------------------
+
+download_and_install_apks() {
+    echo "[*] Downloading APKs..."
+    mkdir -p "$APK_DIR"
+    cd "$APK_DIR"
+    
+    # APK links
+    APK_LINKS=(
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+        "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/File.Manager.+.v3.6.1.Premium.apk"
+    )
+
+    for url in "${APK_LINKS[@]}"; do
+        fname=$(basename "$url")
+        echo "    -> $fname"
+        curl -L -o "$fname" "$url"
+        pm install -r "$fname"
+    done
+
+    echo "[*] Cleaning up APKs..."
+    rm -f "$APK_DIR"/*.apk
+}
+
+download_and_replace_json() {
+    echo "[*] Downloading and replacing JSON..."
+    mkdir -p "$JSON_TMP"
+    cd "$JSON_TMP"
+    curl -L -o "SpeedHubX.Config.json" "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+    
+    if [ -f "$GARDEN_JSON" ]; then
+        cp -f "SpeedHubX.Config.json" "$GARDEN_JSON"
+        echo "[*] JSON replaced at $GARDEN_JSON"
+    else
+        echo "[!] Target JSON not found: $GARDEN_JSON"
+    fi
+}
+
+run_other_script() {
+    echo "[*] Running other related script..."
+    curl -L -o "$OTHER_SCRIPT_PATH" "$OTHER_SCRIPT_URL"
+    lua "$OTHER_SCRIPT_PATH"
+}
+
+# ----------------------------------------------------
+# EXECUTION CONTROL
+# ----------------------------------------------------
+
+case "$1" in
+    apk)
+        download_and_install_apks
+        ;;
+    json)
+        download_and_replace_json
+        ;;
+    other)
+        run_other_script
+        ;;
+    all)
+        download_and_install_apks
+        download_and_replace_json
+        run_other_script
+        ;;
+    *)
+        echo "Usage: $0 {apk|json|other|all}"
+        exit 1
+        ;;
+esac
