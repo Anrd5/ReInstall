@@ -1,34 +1,11 @@
-name: RefreshScript
+name: JSON Task
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  bump-json-trigger:
+  run-json-task:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Bump nonce inside this workflow
+      - name: Run JSON job on Termux
         run: |
-          file=".github/workflows/RefreshScript.yml"
-          stamp="# nonce: $(date -u +%Y%m%dT%H%M%SZ) run=${GITHUB_RUN_ID}"
-          if grep -q '^# nonce:' "$file"; then
-            sed -i "s/^# nonce:.*/$stamp/" "$file"
-          else
-            printf "\n%s\n" "$stamp" >> "$file"
-          fi
-
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/RefreshScript.yml
-          git commit -m "RefreshScript nonce bump: ${GITHUB_RUN_ID}" || echo "No changes to commit"
-          git push
-# nonce: 19700101T000000Z run=0
+          ssh -o StrictHostKeyChecking=no ${{ secrets.TERMUX_SSH }} "bash automation.sh json"
