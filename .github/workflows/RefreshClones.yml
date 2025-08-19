@@ -1,15 +1,18 @@
-name: Refresh APKs & JSON
+name: Refresh APKs Flag
 
 on:
   workflow_dispatch:
 
 jobs:
-  update-and-install:
-    runs-on: self-hosted
-
+  enable-apk-sync:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Run full auto-install
-        run: bash autoinstall.sh
+      - uses: actions/checkout@v2
+      - name: Set apks_flag.txt to 1
+        run: |
+          echo "1" > apks_flag.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apks_flag.txt
+          git commit -m "Enable APK sync"
+          git push
