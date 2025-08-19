@@ -2,36 +2,31 @@ name: RefreshClones
 
 on:
   workflow_dispatch:
-  # Optional: also refresh daily at 00:00 UTC
-  schedule:
-    - cron: "0 0 * * *"
 
 permissions:
   contents: write
 
 jobs:
-  refresh:
+  bump-run-token:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Bump hash comment
+      - name: Bump RUN_TOKEN in this workflow file
         run: |
-          f=".github/workflows/RefreshClones.yml"
-          ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          # Replace or add a single trigger comment line
-          if grep -q '^# trigger:' "$f"; then
-            sed -i "s|^# trigger:.*|# trigger: ${ts}|" "$f"
-          else
-            printf "\n# trigger: %s\n" "$ts" >> "$f"
+          set -euo pipefail
+          FILE=".github/workflows/RefreshClones.yml"
+          TOK="$(date -u +%s)"
+          # Replace existing RUN_TOKEN or append if missing
+          perl -0777 -pe 's/(^|\n)\s*RUN_TOKEN:\s*\K\d+/'"$TOK"'/' -i "$FILE" || true
+          if ! grep -qE '^\s*RUN_TOKEN:\s*[0-9]+' "$FILE"; then
+            printf '\n# Device trigger token\nRUN_TOKEN: %s\n' "$TOK" >> "$FILE"
           fi
-
-      - name: Commit and push
-        run: |
-          ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/RefreshClones.yml
-          git commit -m "Refresh APK trigger ${ts}" || echo "No changes"
+          git add "$FILE"
+          git commit -m "RefreshClones trigger $TOK" || echo "No changes to commit"
           git push
+# Device trigger token
+RUN_TOKEN: 0
