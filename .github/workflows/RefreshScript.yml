@@ -1,15 +1,18 @@
-name: Refresh JSON Only
+name: Refresh JSON Flag
 
 on:
   workflow_dispatch:
 
 jobs:
-  update-json:
-    runs-on: self-hosted
-
+  enable-json-sync:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Run JSON-only update
-        run: bash autoinstall.sh --json
+      - uses: actions/checkout@v2
+      - name: Set json_flag.txt to 1
+        run: |
+          echo "1" > json_flag.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add json_flag.txt
+          git commit -m "Enable JSON sync"
+          git push
