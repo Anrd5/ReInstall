@@ -1,15 +1,37 @@
-name: APK Refresh Trigger
+name: RefreshClones
 
 on:
   workflow_dispatch:
-  # Optional: uncomment to auto-trigger every 12 hours
-  # schedule:
-  #   - cron: "0 */12 * * *"
+  # Optional: also refresh daily at 00:00 UTC
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: write
 
 jobs:
-  ping:
+  refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Emit APK trigger
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bump hash comment
         run: |
-          echo "APK trigger at $(date -u +%FT%TZ)"
+          f=".github/workflows/RefreshClones.yml"
+          ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          # Replace or add a single trigger comment line
+          if grep -q '^# trigger:' "$f"; then
+            sed -i "s|^# trigger:.*|# trigger: ${ts}|" "$f"
+          else
+            printf "\n# trigger: %s\n" "$ts" >> "$f"
+          fi
+
+      - name: Commit and push
+        run: |
+          ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/RefreshClones.yml
+          git commit -m "Refresh APK trigger ${ts}" || echo "No changes"
+          git push
