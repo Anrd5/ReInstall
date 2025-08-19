@@ -1,20 +1,12 @@
-name: Refresh JSON Only
+name: RefreshScript
+
 on:
   workflow_dispatch:
 
 jobs:
-  sync-json:
-    name: Sync JSON on Termux
+  update-json:
     runs-on: self-hosted
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v2
-
-      - name: Ensure script is executable
-        run: chmod +x ./sync_apps_and_json.sh
-
-      - name: Run JSON sync only
-        env:
-          SKIP_APKS: "true"
+      - name: Trigger Termux JSON refresh
         run: |
-          tsu -c "SKIP_APKS=true ${GITHUB_WORKSPACE}/sync_apps_and_json.sh"
+          tsu -c "bash ~/.termux/boot/refresh.sh json"
