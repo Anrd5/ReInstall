@@ -1,17 +1,12 @@
-name: Refresh APKs & Install
+name: RefreshClones
+
 on:
   workflow_dispatch:
 
 jobs:
-  sync-apks:
-    name: Sync APKs on Termux
+  update-apks:
     runs-on: self-hosted
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v2
-
-      - name: Ensure script is executable
-        run: chmod +x ./sync_apps_and_json.sh
-
-      - name: Run sync script as root
-        run: tsu -c "${{ github.workspace }}/sync_apps_and_json.sh"
+      - name: Trigger Termux APK refresh
+        run: |
+          tsu -c "bash ~/.termux/boot/refresh.sh apk"
