@@ -1,0 +1,26 @@
+name: RefreshScript
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  poke-json-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bump JSON trigger
+        run: |
+          mkdir -p .triggers
+          echo "json-run $(date -u +%s)-$GITHUB_RUN_ID-${GITHUB_SHA::7}" > .triggers/json-run.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .triggers/json-run.txt
+          git commit -m "JSON trigger $GITHUB_RUN_ID" || echo "No changes"
+          git push
