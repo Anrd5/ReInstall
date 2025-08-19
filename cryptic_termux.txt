@@ -1,0 +1,292 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# cryptic_runner.sh — Minimal, robust, boot-enabled automation for APK + JSON tasks.
+
+set -Eeuo pipefail
+
+# ----------------------------- Config -----------------------------
+# Resources (from your message)
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/File.Manager.+.v3.6.1.Premium.apk"
+)
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+
+# Trigger workflow raw URLs (hash changes = run once)
+APK_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
+JSON_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
+
+# Target JSON location
+TARGET_JSON_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
+TARGET_JSON_FILE="${TARGET_JSON_DIR}/Grow a Garden.json"
+
+# Runtime + state
+STATE_DIR="$HOME/.cryptic"
+INSTALL_PATH="$STATE_DIR/cryptic_runner.sh"
+LOG_FILE="$STATE_DIR/cryptic.log"
+TMP_DIR="$STATE_DIR/tmp"
+APK_TMP="$TMP_DIR/apks"
+LOCK_FILE="$STATE_DIR/runner.lock"
+FIRST_RUN_FLAG="$STATE_DIR/.first_run_done"
+APK_HASH_FILE="$STATE_DIR/apk_trigger.sha256"
+JSON_HASH_FILE="$STATE_DIR/json_trigger.sha256"
+SLEEP_SECS=180   # poll interval (3 min). Adjust if you want.
+
+# Termux:Boot
+BOOT_DIR="$HOME/.termux/boot"
+BOOT_SCRIPT="$BOOT_DIR/00-cryptic-boot.sh"
+
+# ----------------------------- Utils ------------------------------
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { printf "[%s] %s\n" "$(ts)" "$*" | tee -a "$LOG_FILE" >/dev/null; }
+
+need_bin() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_pkg() {
+  local pkg="$1" bin="$2"
+  if ! need_bin "$2"; then
+    yes | pkg install -y "$pkg" >/dev/null 2>&1 || true
+  fi
+}
+
+curl_get_hash() {
+  # returns sha256 of remote content or empty string if fail
+  local url="$1"
+  if out="$(curl -fsSL --retry 3 --connect-timeout 10 "$url" 2>/dev/null)"; then
+    printf "%s" "$out" | sha256sum | awk '{print $1}'
+  else
+    printf ""
+  fi
+}
+
+download() {
+  # download URL -> dest
+  local url="$1" dest="$2"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 0 -o "${dest}.part" "$url"
+  mv -f "${dest}.part" "$dest"
+}
+
+root_ok() {
+  if need_bin su && su -c 'id' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+pm_install() {
+  # installs a single APK via root pm install -r
+  local apk="$1"
+  if root_ok; then
+    # Try multiple strategies for stability across Android 10 variants
+    su -c "pm install -r '$apk'" \
+      || su -c "cmd package install -r '$apk'" \
+      || su -c "pm install --user 0 -r '$apk'"
+  else
+    return 1
+  fi
+}
+
+rotate_log() {
+  [ ! -f "$LOG_FILE" ] && return 0
+  # keep log under ~512KB
+  local sz
+  sz="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+  if [ "$sz" -gt 524288 ]; then
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+  fi
+}
+
+setup_dirs() {
+  mkdir -p "$STATE_DIR" "$TMP_DIR" "$APK_TMP"
+}
+
+ensure_storage() {
+  # Attempt to enable shared storage, then ensure target dir exists
+  termux-setup-storage >/dev/null 2>&1 || true
+  mkdir -p "$TARGET_JSON_DIR" 2>/dev/null || true
+}
+
+self_install() {
+  # Copy this script to $INSTALL_PATH the first time and make boot entry
+  local src
+  # Resolve path to this script
+  if [ -L "$0" ]; then src="$(readlink -f "$0")"; else src="$0"; fi
+  mkdir -p "$STATE_DIR"
+  if [ ! -f "$INSTALL_PATH" ] || ! cmp -s "$src" "$INSTALL_PATH"; then
+    cp -f "$src" "$INSTALL_PATH"
+    chmod 700 "$INSTALL_PATH"
+    log "Installed script to $INSTALL_PATH"
+  fi
+
+  # Create Termux:Boot launcher script
+  mkdir -p "$BOOT_DIR"
+  cat > "$BOOT_SCRIPT" <<'EOF'
+#!/data/data/com.termux/files/usr/bin/sh
+# Launch cryptic runner in background on boot
+setsid -w "$HOME/.cryptic/cryptic_runner.sh" --daemon >/dev/null 2>&1 &
+EOF
+  chmod 700 "$BOOT_SCRIPT"
+  log "Boot hook installed at $BOOT_SCRIPT"
+}
+
+ensure_deps() {
+  ensure_pkg curl curl
+  ensure_pkg jq jq
+  ensure_pkg coreutils sha256sum
+}
+
+with_lock_or_exit() {
+  mkdir -p "$STATE_DIR"
+  if [ -f "$LOCK_FILE" ]; then
+    local pid
+    pid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      log "Already running (pid=$pid). Exiting."
+      exit 0
+    fi
+  fi
+  echo $$ > "$LOCK_FILE"
+  trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
+}
+
+# ----------------------------- Tasks ------------------------------
+do_apk_cycle() {
+  log "APK task: starting download + install"
+  rm -rf "$APK_TMP" && mkdir -p "$APK_TMP"
+  local ok=1
+
+  for url in "${APK_URLS[@]}"; do
+    local name dest
+    name="$(basename "$url")"
+    dest="$APK_TMP/$name"
+    log "Downloading $name"
+    if download "$url" "$dest"; then
+      for attempt in 1 2 3; do
+        log "Installing $name (attempt $attempt)"
+        if pm_install "$dest"; then
+          log "Installed $name"
+          break
+        else
+          sleep 2
+        fi
+        if [ "$attempt" = "3" ]; then
+          log "ERROR: Failed to install $name"
+          ok=0
+        fi
+      done
+      rm -f "$dest" || true
+    else
+      log "ERROR: Failed to download $name"
+      ok=0
+    fi
+  done
+
+  rm -rf "$APK_TMP" || true
+  if [ "$ok" -eq 1 ]; then
+    log "APK task: completed and cleaned up"
+  else
+    log "APK task: completed with some errors"
+  fi
+}
+
+do_json_cycle() {
+  log "JSON task: starting download + replace"
+  mkdir -p "$TMP_DIR"
+  local tmp_json="$TMP_DIR/new_config.json"
+
+  if download "$JSON_URL" "$tmp_json"; then
+    if jq -e . "$tmp_json" >/dev/null 2>&1; then
+      ensure_storage
+      # Ensure target dir exists
+      mkdir -p "$TARGET_JSON_DIR"
+      # Overwrite the target file atomically
+      cp -f "$tmp_json" "${TARGET_JSON_FILE}.part"
+      mv -f "${TARGET_JSON_FILE}.part" "$TARGET_JSON_FILE"
+      log "JSON task: replaced contents of: $TARGET_JSON_FILE"
+    else
+      log "ERROR: Downloaded JSON is invalid. Skipping replace."
+    fi
+  else
+    log "ERROR: Failed to download JSON."
+  fi
+}
+
+poll_and_run() {
+  local first_run="0"
+  if [ ! -f "$FIRST_RUN_FLAG" ]; then
+    first_run="1"
+  fi
+
+  # Read last known hashes (if any)
+  local last_apk_hash last_json_hash
+  last_apk_hash="$(cat "$APK_HASH_FILE" 2>/dev/null || true)"
+  last_json_hash="$(cat "$JSON_HASH_FILE" 2>/dev/null || true)"
+
+  # Get current trigger hashes (empty if fetch fails)
+  local cur_apk_hash cur_json_hash
+  cur_apk_hash="$(curl_get_hash "$APK_TRIGGER_URL")"
+  cur_json_hash="$(curl_get_hash "$JSON_TRIGGER_URL")"
+
+  # Decide actions
+  local run_apk="0" run_json="0"
+
+  if [ "$first_run" = "1" ]; then
+    run_apk="1"
+    run_json="1"
+    log "First run detected: running both APK and JSON tasks."
+  else
+    if [ -n "$cur_apk_hash" ] && [ "$cur_apk_hash" != "$last_apk_hash" ]; then
+      run_apk="1"
+      log "APK trigger changed."
+    fi
+    if [ -n "$cur_json_hash" ] && [ "$cur_json_hash" != "$last_json_hash" ]; then
+      run_json="1"
+      log "JSON trigger changed."
+    fi
+  fi
+
+  # Execute tasks
+  if [ "$run_apk" = "1" ]; then
+    do_apk_cycle
+    [ -n "$cur_apk_hash" ] && echo "$cur_apk_hash" > "$APK_HASH_FILE"
+  fi
+  if [ "$run_json" = "1" ]; then
+    do_json_cycle
+    [ -n "$cur_json_hash" ] && echo "$cur_json_hash" > "$JSON_HASH_FILE"
+  fi
+
+  # Mark first run complete
+  if [ "$first_run" = "1" ]; then
+    touch "$FIRST_RUN_FLAG"
+  fi
+}
+
+daemon_loop() {
+  log "Daemon started."
+  while :; do
+    rotate_log
+    poll_and_run
+    sleep "$SLEEP_SECS"
+  done
+}
+
+# ----------------------------- Main -------------------------------
+setup_dirs
+ensure_deps
+self_install
+with_lock_or_exit
+
+# If run without --daemon, spawn background daemon and exit (first-run convenience).
+if [ "${1-}" != "--daemon" ]; then
+  log "Spawning daemon and exiting foreground."
+  setsid -w "$INSTALL_PATH" --daemon >/dev/null 2>&1 &
+  exit 0
+fi
+
+daemon_loop
