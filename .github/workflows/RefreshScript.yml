@@ -1,15 +1,36 @@
-name: JSON Refresh Trigger
+name: RefreshScript
 
 on:
   workflow_dispatch:
-  # Optional: uncomment to auto-trigger daily at 03:00 UTC
-  # schedule:
-  #   - cron: "0 3 * * *"
+  # Optional: also refresh daily at 00:05 UTC (staggered)
+  schedule:
+    - cron: "5 0 * * *"
+
+permissions:
+  contents: write
 
 jobs:
-  ping:
+  refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Emit JSON trigger
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bump hash comment
         run: |
-          echo "JSON trigger at $(date -u +%FT%TZ)"
+          f=".github/workflows/RefreshScript.yml"
+          ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          if grep -q '^# trigger:' "$f"; then
+            sed -i "s|^# trigger:.*|# trigger: ${ts}|" "$f"
+          else
+            printf "\n# trigger: %s\n" "$ts" >> "$f"
+          fi
+
+      - name: Commit and push
+        run: |
+          ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/RefreshScript.yml
+          git commit -m "Refresh JSON trigger ${ts}" || echo "No changes"
+          git push
