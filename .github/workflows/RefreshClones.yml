@@ -1,18 +1,1 @@
-name: Refresh APKs Flag
-
-on:
-  workflow_dispatch:
-
-jobs:
-  enable-apk-sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Set apks_flag.txt to 1
-        run: |
-          echo "1" > apks_flag.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apks_flag.txt
-          git commit -m "Enable APK sync"
-          git push
+0
