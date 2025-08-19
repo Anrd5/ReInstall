@@ -6,7 +6,7 @@ permissions:
   contents: write
 
 jobs:
-  poke-apk-trigger:
+  bump-apk-trigger:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
