@@ -6,7 +6,7 @@ permissions:
   contents: write
 
 jobs:
-  poke-json-trigger:
+  bump-json-trigger:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
