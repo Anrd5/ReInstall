@@ -1,292 +1,455 @@
-#!/data/data/com.termux/files/usr/bin/bash
-# cryptic_runner.sh — Minimal, robust, boot-enabled automation for APK + JSON tasks.
-
+#!/data/data/com.termux/files/usr/bin/env bash
+# SpeedHubX Termux Automation – Release-asset change detection with progress UI
+# v1.2 — Adds progress bars and spinner for friendlier UX
 set -Eeuo pipefail
+IFS=$'\n\t'
 
-# ----------------------------- Config -----------------------------
-# Resources (from your message)
+#############################
+# Configuration
+#############################
 APK_URLS=(
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/File.Manager.+.v3.6.1.Premium.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+ "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/File.Manager.+.v3.6.1.Premium.apk"
 )
 JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+DEST_JSON="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
+SPEEDHUBX_INTERVAL="${SPEEDHUBX_INTERVAL:-1800}" # 30 minutes default
+BOOT_FETCH_URL="${SPEEDHUBX_SCRIPT_URL:-}"
 
-# Trigger workflow raw URLs (hash changes = run once)
-APK_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
-JSON_TRIGGER_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
+#############################
+# Paths and state
+#############################
+PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
+HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
+STATE_DIR="$PREFIX_DIR/var/lib/speedhubx"
+WORK_DIR="$PREFIX_DIR/var/tmp/speedhubx"
+LOG_DIR="$PREFIX_DIR/var/log"
+LOG_FILE="$LOG_DIR/speedhubx.log"
+BOOT_DIR="$HOME_DIR/.termux/boot"
+LOCK_DIR="$STATE_DIR/.lock"
 
-# Target JSON location
-TARGET_JSON_DIR="/storage/emulated/0/Cryptic/Workspace/SpeedHubX"
-TARGET_JSON_FILE="${TARGET_JSON_DIR}/Grow a Garden.json"
+mkdir -p "$STATE_DIR" "$WORK_DIR" "$LOG_DIR"
 
-# Runtime + state
-STATE_DIR="$HOME/.cryptic"
-INSTALL_PATH="$STATE_DIR/cryptic_runner.sh"
-LOG_FILE="$STATE_DIR/cryptic.log"
-TMP_DIR="$STATE_DIR/tmp"
-APK_TMP="$TMP_DIR/apks"
-LOCK_FILE="$STATE_DIR/runner.lock"
-FIRST_RUN_FLAG="$STATE_DIR/.first_run_done"
-APK_HASH_FILE="$STATE_DIR/apk_trigger.sha256"
-JSON_HASH_FILE="$STATE_DIR/json_trigger.sha256"
-SLEEP_SECS=180   # poll interval (3 min). Adjust if you want.
+FIRST_RUN_FLAG="$STATE_DIR/first_run.done"
+BOOT_INSTALLED_FLAG="$STATE_DIR/boot_installed.flag"
 
-# Termux:Boot
-BOOT_DIR="$HOME/.termux/boot"
-BOOT_SCRIPT="$BOOT_DIR/00-cryptic-boot.sh"
+# Map for pre-downloaded files when computing sha fallback
+declare -gA PRE_DL_FILES=()
 
-# ----------------------------- Utils ------------------------------
-ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-log() { printf "[%s] %s\n" "$(ts)" "$*" | tee -a "$LOG_FILE" >/dev/null; }
+#############################
+# Colors & logging
+#############################
+COLOR_RESET="\033[0m"
+COLOR_INFO="\033[1;34m"   # bold blue
+COLOR_OK="\033[1;32m"     # bold green
+COLOR_WARN="\033[1;33m"   # bold yellow
+COLOR_ERR="\033[1;31m"    # bold red
 
-need_bin() { command -v "$1" >/dev/null 2>&1; }
-
-ensure_pkg() {
-  local pkg="$1" bin="$2"
-  if ! need_bin "$2"; then
-    yes | pkg install -y "$pkg" >/dev/null 2>&1 || true
-  fi
+log() {
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  printf "[%s] %s\n" "$ts" "$*" | tee -a "$LOG_FILE"
 }
 
-curl_get_hash() {
-  # returns sha256 of remote content or empty string if fail
-  local url="$1"
-  if out="$(curl -fsSL --retry 3 --connect-timeout 10 "$url" 2>/dev/null)"; then
-    printf "%s" "$out" | sha256sum | awk '{print $1}'
+echo_info() { printf "%b%s%b\n" "$COLOR_INFO" "$*" "$COLOR_RESET"; log "$*"; }
+echo_ok()   { printf "%b%s%b\n" "$COLOR_OK" "$*" "$COLOR_RESET"; log "$*"; }
+echo_warn() { printf "%b%s%b\n" "$COLOR_WARN" "$*" "$COLOR_RESET"; log "$*"; }
+echo_err()  { printf "%b%s%b\n" "$COLOR_ERR" "$*" "$COLOR_RESET"; log "$*"; }
+
+on_error() {
+  echo_err "ERROR: Line $1 exited with status $2"
+}
+trap 'on_error "$LINENO" "$?"' ERR
+
+#############################
+# Utilities
+#############################
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo_warn "Command '$1' missing. Attempting to install via pkg..."
+    yes | pkg install -y "$1" >/dev/null 2>&1 || true
+    command -v "$1" >/dev/null 2>&1 || { echo_err "Fatal: missing command '$1'"; exit 1; }
+  }
+}
+
+ensure_basics() {
+  require_cmd curl
+  # prefer sha256sum
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1 && ! command -v openssl >/dev/null 2>&1; then
+    require_cmd coreutils || true
+  fi
+  # pm/su might not be present on non-android hosts, that's OK
+  termux-setup-storage >/dev/null 2>&1 || true
+}
+
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    trap 'rm -rf "$LOCK_DIR"' EXIT
   else
-    printf ""
+    echo_warn "Another instance appears to be running. Exiting."
+    exit 0
   fi
 }
 
-download() {
-  # download URL -> dest
-  local url="$1" dest="$2"
-  curl -fL --retry 3 --connect-timeout 15 --max-time 0 -o "${dest}.part" "$url"
-  mv -f "${dest}.part" "$dest"
+# Spinner for quick operations (background)
+spinner_start() {
+  # $1 = message
+  local msg=$1
+  printf "%s " "$msg"
+  # start spinner in background
+  (
+    local i=0
+    local sp='|/-\'
+    while :; do
+      printf "\b%c" "${sp:i++%${#sp}:1}"
+      sleep 0.12
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID" 2>/dev/null || true
 }
 
-root_ok() {
-  if need_bin su && su -c 'id' >/dev/null 2>&1; then
+spinner_stop() {
+  local code=${1:-0}
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    unset SPINNER_PID
+    if [[ "$code" -eq 0 ]]; then
+      printf "\b" && echo_ok " done."
+    else
+      printf "\b" && echo_err " failed."
+    fi
+  fi
+}
+
+# Download with curl progress bar to target path (atomic move)
+download_with_progress() {
+  # $1 = url, $2 = out_path
+  local url="$1" out="$2" tmp
+  tmp="$(mktemp -p "$WORK_DIR" "$(basename "$out").tmp.XXXXXX")"
+  echo_info "Downloading: $url"
+  if curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 3600 \
+      -A "SpeedHubX/1.2 (Termux)" --progress-bar -o "$tmp" "$url"; then
+    mv -f "$tmp" "$out"
+    echo_ok "Saved to: $out"
     return 0
-  fi
-  return 1
-}
-
-pm_install() {
-  # installs a single APK via root pm install -r
-  local apk="$1"
-  if root_ok; then
-    # Try multiple strategies for stability across Android 10 variants
-    su -c "pm install -r '$apk'" \
-      || su -c "cmd package install -r '$apk'" \
-      || su -c "pm install --user 0 -r '$apk'"
   else
+    rm -f -- "$tmp" || true
+    echo_err "Download failed: $url"
     return 1
   fi
 }
 
-rotate_log() {
-  [ ! -f "$LOG_FILE" ] && return 0
-  # keep log under ~512KB
-  local sz
-  sz="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
-  if [ "$sz" -gt 524288 ]; then
-    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
-  fi
-}
-
-setup_dirs() {
-  mkdir -p "$STATE_DIR" "$TMP_DIR" "$APK_TMP"
-}
-
-ensure_storage() {
-  # Attempt to enable shared storage, then ensure target dir exists
-  termux-setup-storage >/dev/null 2>&1 || true
-  mkdir -p "$TARGET_JSON_DIR" 2>/dev/null || true
-}
-
-self_install() {
-  # Copy this script to $INSTALL_PATH the first time and make boot entry
-  local src
-  # Resolve path to this script
-  if [ -L "$0" ]; then src="$(readlink -f "$0")"; else src="$0"; fi
-  mkdir -p "$STATE_DIR"
-  if [ ! -f "$INSTALL_PATH" ] || ! cmp -s "$src" "$INSTALL_PATH"; then
-    cp -f "$src" "$INSTALL_PATH"
-    chmod 700 "$INSTALL_PATH"
-    log "Installed script to $INSTALL_PATH"
-  fi
-
-  # Create Termux:Boot launcher script
-  mkdir -p "$BOOT_DIR"
-  cat > "$BOOT_SCRIPT" <<'EOF'
-#!/data/data/com.termux/files/usr/bin/sh
-# Launch cryptic runner in background on boot
-setsid -w "$HOME/.cryptic/cryptic_runner.sh" --daemon >/dev/null 2>&1 &
-EOF
-  chmod 700 "$BOOT_SCRIPT"
-  log "Boot hook installed at $BOOT_SCRIPT"
-}
-
-ensure_deps() {
-  ensure_pkg curl curl
-  ensure_pkg jq jq
-  ensure_pkg coreutils sha256sum
-}
-
-with_lock_or_exit() {
-  mkdir -p "$STATE_DIR"
-  if [ -f "$LOCK_FILE" ]; then
-    local pid
-    pid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
-    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-      log "Already running (pid=$pid). Exiting."
-      exit 0
+# Compute sha256 of file (portable)
+file_sha256() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$f" | awk '{print $2}'
+  else
+    # fallback using python if available
+    if command -v python >/dev/null 2>&1; then
+      python - <<PY -c "import sys,hashlib; h=hashlib.sha256(); h.update(sys.stdin.buffer.read()); print(h.hexdigest())" < "$f"
+    else
+      echo ""
     fi
   fi
-  echo $$ > "$LOCK_FILE"
-  trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
 }
 
-# ----------------------------- Tasks ------------------------------
-do_apk_cycle() {
-  log "APK task: starting download + install"
-  rm -rf "$APK_TMP" && mkdir -p "$APK_TMP"
-  local ok=1
+# Hash a string deterministically (used for state filenames)
+hash_string() {
+  local s="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf "%s" "$s" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf "%s" "$s" | shasum -a 256 | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    printf "%s" "$s" | openssl dgst -sha256 | awk '{print $2}'
+  else
+    printf "%s" "$s" | md5sum | awk '{print $1}'
+  fi
+}
 
+state_file_for_url() {
+  local url="$1"
+  local urlhash
+  urlhash="$(hash_string "$url")"
+  urlhash="${urlhash:0:16}"
+  printf "%s/remote_%s.id" "$STATE_DIR" "$urlhash"
+}
+
+# Try to extract ETag or Last-Modified, else download to temp with progress and compute sha.
+# Returns string like "etag:<value>", "lm:<value>", or "sha256:<hex>"
+# For the sha256 fallback it will download to a temporary file and populate PRE_DL_FILES[url]=tmpfile
+fetch_remote_id() {
+  local url="$1"
+  local headers etag lm tmp sha
+
+  # perform HEAD-ish request (curl -I follows redirects)
+  spinner_start "Checking headers for $(basename "$url")"
+  headers="$(curl -sI -L --max-time 30 -A "SpeedHubX/1.2" "$url" 2>/dev/null || true)"
+  spinner_stop 0
+
+  etag="$(printf "%s" "$headers" | awk 'BEGIN{IGNORECASE=1} /ETag:/ {gsub(/^[ \t]+|[ \t]+$/,"",$0); sub(/ETag:[ \t]*/,"",$0); print $0; exit}')"
+  if [[ -n "${etag:-}" ]]; then
+    printf "etag:%s" "$etag"
+    return 0
+  fi
+
+  lm="$(printf "%s" "$headers" | awk 'BEGIN{IGNORECASE=1} /Last-Modified:/ {gsub(/^[ \t]+|[ \t]+$/,"",$0); sub(/Last-Modified:[ \t]*/,"",$0); print $0; exit}')"
+  if [[ -n "${lm:-}" ]]; then
+    printf "lm:%s" "$lm"
+    return 0
+  fi
+
+  # Fallback: download to temp with progress and sha
+  echo_warn "No ETag/Last-Modified for $(basename "$url"); will download to compute sha256 (progress shown)."
+  tmp="$(mktemp -p "$WORK_DIR" "$(basename "$url").prefetch.XXXXXX")"
+  if download_with_progress "$url" "$tmp"; then
+    sha="$(file_sha256 "$tmp")"
+    if [[ -n "$sha" ]]; then
+      PRE_DL_FILES["$url"]="$tmp"
+      printf "sha256:%s" "$sha"
+      return 0
+    else
+      rm -f -- "$tmp" || true
+      return 1
+    fi
+  else
+    rm -f -- "$tmp" || true
+    return 1
+  fi
+}
+
+# Handler: silent install an APK path (if predownloaded path provided re-use it)
+silent_pm_install() {
+  local apk="$1"
+  if command -v su >/dev/null 2>&1; then
+    su -c "pm install -r --user 0 \"$apk\"" >/dev/null 2>&1 || \
+      su -c "pm install -r \"$apk\"" >/dev/null 2>&1 || \
+      pm install -r "$apk"
+  else
+    pm install -r "$apk"
+  fi
+}
+
+apk_handler() {
+  # $1=url, $2=name, optional $3=predownloaded-file
+  local url="$1" name="$2" pre="$3"
+  local apkdir out tmp
+
+  apkdir="$WORK_DIR/apks"
+  mkdir -p "$apkdir"
+  out="$apkdir/$name"
+
+  if [[ -n "${pre:-}" && -f "$pre" ]]; then
+    echo_info "Using predownload for $name"
+    mv -f "$pre" "$out"
+    unset PRE_DL_FILES["$url"]
+  else
+    # download with progress
+    tmp="$out.tmp"
+    if ! download_with_progress "$url" "$tmp"; then
+      echo_err "Failed to download $name"
+      return 1
+    fi
+    mv -f "$tmp" "$out"
+  fi
+
+  echo_info "Installing $name (silent if permitted)..."
+  if silent_pm_install "$out"; then
+    echo_ok "Install success: $name"
+  else
+    echo_warn "Install command returned non-zero for $name (may require manual approval)"
+  fi
+
+  # cleanup apk after install to save storage; keep for debugging if you prefer
+  rm -f -- "$out" || true
+}
+
+json_handler() {
+  # $1=url, $2=name, optional $3=predownloaded-file
+  local url="$1" name="$2" pre="$3"
+  local tmp
+
+  if [[ -n "${pre:-}" && -f "$pre" ]]; then
+    tmp="$pre"
+    echo_info "Using predownload for JSON: $name"
+  else
+    tmp="$(mktemp -p "$WORK_DIR" "speedhubx.json.tmp.XXXXXX")"
+    if ! download_with_progress "$url" "$tmp"; then
+      echo_err "Failed to download JSON: $name"
+      rm -f -- "$tmp" || true
+      return 1
+    fi
+  fi
+
+  mkdir -p "$(dirname "$DEST_JSON")"
+  install -m 600 "$tmp" "$DEST_JSON"
+  echo_ok "JSON written to: $DEST_JSON"
+
+  # remove predownload or tmp
+  if [[ -n "${PRE_DL_FILES[$url]:-}" && "${PRE_DL_FILES[$url]}" == "$tmp" ]]; then
+    unset PRE_DL_FILES["$url"]
+  else
+    rm -f -- "$tmp" || true
+  fi
+}
+
+check_and_run_url() {
+  # $1 = url, $2 = name, $3 = handler function name
+  local url="$1" name="$2" handler="$3"
+  local statefile newid oldid prefile
+
+  statefile="$(state_file_for_url "$url")"
+  mkdir -p "$(dirname "$statefile")"
+
+  echo_info "Checking remote for: $name"
+  if ! newid="$(fetch_remote_id "$url" 2>/dev/null || true)"; then
+    echo_warn "Could not determine remote id for $name ($url); skipping"
+    return 0
+  fi
+
+  # If there is a predownloaded file from fetch_remote_id sha fallback, capture it
+  prefile="${PRE_DL_FILES[$url]:-}"
+
+  if [[ ! -s "$statefile" ]]; then
+    echo_warn "$name: No prior state; treating as changed and running handler"
+    echo "$newid" >"$statefile".tmp && mv "$statefile".tmp "$statefile"
+    "$handler" "$url" "$name" "$prefile"
+    return 0
+  fi
+
+  oldid="$(cat "$statefile" 2>/dev/null || true)"
+  if [[ "$newid" != "$oldid" ]]; then
+    echo_info "$name: Change detected (old != new). Running handler..."
+    echo "$newid" >"$statefile".tmp && mv "$statefile".tmp "$statefile"
+    "$handler" "$url" "$name" "$prefile"
+  else
+    echo_ok "$name: No change."
+    # cleanup any predownloaded file we won't use
+    if [[ -n "$prefile" && -f "$prefile" ]]; then
+      rm -f -- "$prefile" || true
+      unset PRE_DL_FILES["$url"]
+    fi
+  fi
+}
+
+run_apk_tasks() {
+  echo_info "APK: Checking configured APK URLs..."
   for url in "${APK_URLS[@]}"; do
-    local name dest
+    local name
     name="$(basename "$url")"
-    dest="$APK_TMP/$name"
-    log "Downloading $name"
-    if download "$url" "$dest"; then
-      for attempt in 1 2 3; do
-        log "Installing $name (attempt $attempt)"
-        if pm_install "$dest"; then
-          log "Installed $name"
-          break
-        else
-          sleep 2
-        fi
-        if [ "$attempt" = "3" ]; then
-          log "ERROR: Failed to install $name"
-          ok=0
-        fi
-      done
-      rm -f "$dest" || true
-    else
-      log "ERROR: Failed to download $name"
-      ok=0
-    fi
+    check_and_run_url "$url" "$name" apk_handler
   done
-
-  rm -rf "$APK_TMP" || true
-  if [ "$ok" -eq 1 ]; then
-    log "APK task: completed and cleaned up"
-  else
-    log "APK task: completed with some errors"
-  fi
+  echo_info "APK checks done."
 }
 
-do_json_cycle() {
-  log "JSON task: starting download + replace"
-  mkdir -p "$TMP_DIR"
-  local tmp_json="$TMP_DIR/new_config.json"
+run_json_tasks() {
+  echo_info "JSON: Checking JSON URL..."
+  check_and_run_url "$JSON_URL" "SpeedHubX.Config.json" json_handler
+}
 
-  if download "$JSON_URL" "$tmp_json"; then
-    if jq -e . "$tmp_json" >/dev/null 2>&1; then
-      ensure_storage
-      # Ensure target dir exists
-      mkdir -p "$TARGET_JSON_DIR"
-      # Overwrite the target file atomically
-      cp -f "$tmp_json" "${TARGET_JSON_FILE}.part"
-      mv -f "${TARGET_JSON_FILE}.part" "$TARGET_JSON_FILE"
-      log "JSON task: replaced contents of: $TARGET_JSON_FILE"
+install_termux_boot() {
+  mkdir -p "$BOOT_DIR"
+  if [[ -n "$BOOT_FETCH_URL" ]]; then
+    cat >"$BOOT_DIR/99-speedhubx.sh" <<EOF
+#!/data/data/com.termux/files/usr/bin/env bash
+set -Eeuo pipefail
+export SPEEDHUBX_INTERVAL="${SPEEDHUBX_INTERVAL}"
+curl -fL --retry 5 --connect-timeout 15 --max-time 120 \
+  -A "SpeedHubX/1.2 (TermuxBoot)" \
+  "$BOOT_FETCH_URL" | bash -s -- --boot
+EOF
+    chmod +x "$BOOT_DIR/99-speedhubx.sh"
+    echo_ok "Installed Termux:Boot fetch-run launcher"
+  else
+    if [[ -f "$0" && -r "$0" ]]; then
+      cp -f "$0" "$BOOT_DIR/99-speedhubx.sh"
+      chmod +x "$BOOT_DIR/99-speedhubx.sh"
+      echo_ok "Installed this script into Termux:Boot"
     else
-      log "ERROR: Downloaded JSON is invalid. Skipping replace."
+      cat >"$BOOT_DIR/99-speedhubx.sh" <<'EOSH'
+#!/data/data/com.termux/files/usr/bin/env bash
+set -Eeuo pipefail
+STATE_DIR="${PREFIX:-/data/data/com.termux/files/usr}/var/lib/speedhubx"
+WORKER="$STATE_DIR/worker.sh"
+if [[ -x "$WORKER" ]]; then
+  bash "$WORKER" --boot
+fi
+EOSH
+      chmod +x "$BOOT_DIR/99-speedhubx.sh"
+      mkdir -p "$STATE_DIR"
+      if [[ -f "$0" ]]; then
+        cp -f "$0" "$STATE_DIR/worker.sh"
+        chmod +x "$STATE_DIR/worker.sh"
+      fi
+      echo_ok "Installed bootstrap into Termux:Boot (no URL provided)"
     fi
-  else
-    log "ERROR: Failed to download JSON."
   fi
+  touch "$BOOT_INSTALLED_FLAG"
 }
 
-poll_and_run() {
-  local first_run="0"
-  if [ ! -f "$FIRST_RUN_FLAG" ]; then
-    first_run="1"
-  fi
-
-  # Read last known hashes (if any)
-  local last_apk_hash last_json_hash
-  last_apk_hash="$(cat "$APK_HASH_FILE" 2>/dev/null || true)"
-  last_json_hash="$(cat "$JSON_HASH_FILE" 2>/dev/null || true)"
-
-  # Get current trigger hashes (empty if fetch fails)
-  local cur_apk_hash cur_json_hash
-  cur_apk_hash="$(curl_get_hash "$APK_TRIGGER_URL")"
-  cur_json_hash="$(curl_get_hash "$JSON_TRIGGER_URL")"
-
-  # Decide actions
-  local run_apk="0" run_json="0"
-
-  if [ "$first_run" = "1" ]; then
-    run_apk="1"
-    run_json="1"
-    log "First run detected: running both APK and JSON tasks."
-  else
-    if [ -n "$cur_apk_hash" ] && [ "$cur_apk_hash" != "$last_apk_hash" ]; then
-      run_apk="1"
-      log "APK trigger changed."
-    fi
-    if [ -n "$cur_json_hash" ] && [ "$cur_json_hash" != "$last_json_hash" ]; then
-      run_json="1"
-      log "JSON trigger changed."
-    fi
-  fi
-
-  # Execute tasks
-  if [ "$run_apk" = "1" ]; then
-    do_apk_cycle
-    [ -n "$cur_apk_hash" ] && echo "$cur_apk_hash" > "$APK_HASH_FILE"
-  fi
-  if [ "$run_json" = "1" ]; then
-    do_json_cycle
-    [ -n "$cur_json_hash" ] && echo "$cur_json_hash" > "$JSON_HASH_FILE"
-  fi
-
-  # Mark first run complete
-  if [ "$first_run" = "1" ]; then
+first_run_init() {
+  if [[ ! -f "$FIRST_RUN_FLAG" ]]; then
+    echo_info "First execution: performing initial fetch/install (will treat resources as changed)."
+    run_apk_tasks
+    run_json_tasks
     touch "$FIRST_RUN_FLAG"
   fi
 }
 
-daemon_loop() {
-  log "Daemon started."
-  while :; do
-    rotate_log
-    poll_and_run
-    sleep "$SLEEP_SECS"
+continuous_loop() {
+  echo_info "Entering continuous mode; polling every ${SPEEDHUBX_INTERVAL}s"
+  while true; do
+    run_apk_tasks
+    run_json_tasks
+    sleep "$SPEEDHUBX_INTERVAL"
   done
 }
 
-# ----------------------------- Main -------------------------------
-setup_dirs
-ensure_deps
-self_install
-with_lock_or_exit
+main() {
+  acquire_lock
+  ensure_basics
 
-# If run without --daemon, spawn background daemon and exit (first-run convenience).
-if [ "${1-}" != "--daemon" ]; then
-  log "Spawning daemon and exiting foreground."
-  setsid -w "$INSTALL_PATH" --daemon >/dev/null 2>&1 &
-  exit 0
-fi
+  if [[ ! -f "$BOOT_INSTALLED_FLAG" ]]; then
+    install_termux_boot
+  fi
 
-daemon_loop
+  first_run_init
+  continuous_loop
+}
+
+case "${1:-}" in
+  --boot)
+    shift
+    main
+    ;;
+  --once)
+    acquire_lock
+    ensure_basics
+    run_apk_tasks
+    run_json_tasks
+    ;;
+  --help|-h)
+    cat <<EOF
+Usage: speedhubx.sh [--boot | --once]
+  --boot    Run in boot/continuous mode (default)
+  --once    Run a single-check cycle and exit
+EOF
+    ;;
+  *)
+    main
+    ;;
+esac
