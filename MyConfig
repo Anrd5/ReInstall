@@ -1,0 +1,29 @@
+{
+  "type": "recorder",
+  "name": "MyConfig.json",
+  "recorded_inputs": [
+    "2",
+    "2",
+    "/storage/emulated/0/Cryptic/Workspace/SpeedHubX",
+    "1",
+    "https://github.com/Anrd5/ReInstall/blob/main/SpeedHubX",
+    "Y",
+    "A",
+    "D",
+    "",
+    "1",
+    "A",
+    "A",
+    "q",
+    "q",
+    "1",
+    "2",
+    "1",
+    "all",
+    "",
+    "q",
+    "1",
+    "60"
+  ],
+  "autostart": true
+}
