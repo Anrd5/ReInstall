@@ -1,0 +1,158 @@
+{
+  "type": "recorder",
+  "events": [
+    {
+      "name": "main_menu",
+      "kind": "screen",
+      "ts": 1757115034.5608382
+    },
+    {
+      "prompt": "Choice: ",
+      "default": null,
+      "value": "1",
+      "kind": "input",
+      "ts": 1757115036.5935311
+    },
+    {
+      "menu": "main_menu",
+      "choice": "1",
+      "kind": "choose",
+      "ts": 1757115036.5935435
+    },
+    {
+      "name": "session_interface",
+      "kind": "screen",
+      "ts": 1757115036.5935478
+    },
+    {
+      "prompt": "Choice: ",
+      "default": null,
+      "value": "2",
+      "kind": "input",
+      "ts": 1757115037.4034894
+    },
+    {
+      "menu": "session_interface",
+      "choice": "2",
+      "kind": "choose",
+      "ts": 1757115037.4035
+    },
+    {
+      "name": "setup_session",
+      "kind": "screen",
+      "ts": 1757115037.4035053
+    },
+    {
+      "prompt": "Enter Script/Github Url: ",
+      "default": "https://gist.githubusercontent.com/Anrd5/355026995e629a556bd46dbaba8dd092/raw/5b667c89ad44505dbcdf0b99791d53cd9a99d57e/Reinstall",
+      "value": "https://gist.githubusercontent.com/Anrd5/d373363202627ed8cdc323c470f09cd0/raw/62a46edca26d3817661394cfdbde5163810944de/Reconnect",
+      "kind": "input",
+      "ts": 1757115042.2994194
+    },
+    {
+      "prompt": "Enter session name [Reinstall]: ",
+      "default": "Reinstall",
+      "value": "Reconnect",
+      "kind": "input",
+      "ts": 1757115054.3716633
+    },
+    {
+      "prompt": "Use tsu for curl payload? [Y/n]: ",
+      "default": "Y",
+      "value": "n",
+      "kind": "input",
+      "ts": 1757115055.9873574
+    },
+    {
+      "prompt": "Press Enter...",
+      "default": null,
+      "value": "",
+      "kind": "input",
+      "ts": 1757115057.553167
+    },
+    {
+      "name": "session_interface",
+      "kind": "screen",
+      "ts": 1757115057.5531752
+    },
+    {
+      "prompt": "Choice: ",
+      "default": null,
+      "value": "1",
+      "kind": "input",
+      "ts": 1757115060.07493
+    },
+    {
+      "menu": "session_interface",
+      "choice": "1",
+      "kind": "choose",
+      "ts": 1757115060.0749404
+    },
+    {
+      "name": "start_session_ui",
+      "kind": "screen",
+      "ts": 1757115060.0749469
+    },
+    {
+      "prompt": "> ",
+      "default": null,
+      "value": "s2",
+      "kind": "input",
+      "ts": 1757115065.5284493
+    },
+    {
+      "menu": "start_session_ui",
+      "choice": "s2",
+      "kind": "choose",
+      "ts": 1757115065.5284665
+    },
+    {
+      "name": "start_session_ui",
+      "kind": "screen",
+      "ts": 1757115065.760456
+    },
+    {
+      "prompt": "> ",
+      "default": null,
+      "value": "q",
+      "kind": "input",
+      "ts": 1757115070.2456198
+    },
+    {
+      "menu": "start_session_ui",
+      "choice": "q",
+      "kind": "choose",
+      "ts": 1757115070.245628
+    },
+    {
+      "name": "session_interface",
+      "kind": "screen",
+      "ts": 1757115070.2456481
+    },
+    {
+      "prompt": "Choice: ",
+      "default": null,
+      "value": "q",
+      "kind": "input",
+      "ts": 1757115072.3265245
+    },
+    {
+      "menu": "session_interface",
+      "choice": "q",
+      "kind": "choose",
+      "ts": 1757115072.3265345
+    },
+    {
+      "name": "main_menu",
+      "kind": "screen",
+      "ts": 1757115072.3265383
+    },
+    {
+      "prompt": "Save as (name.json): ",
+      "default": "rec-20250906-073115.json",
+      "value": "MyConfig5.json",
+      "kind": "input",
+      "ts": 1757115088.681267
+    }
+  ]
+}
